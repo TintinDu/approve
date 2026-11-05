@@ -1,0 +1,16 @@
+{
+  "display_information": {
+    "name": "mr-approver",
+    "description": "Lit les annonces de merge requests et y ajoute une réaction."
+  },
+  "oauth_config": {
+    "scopes": {
+      "user": ["search:read", "reactions:read", "reactions:write"]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

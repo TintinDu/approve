@@ -1,0 +1,9 @@
+approve_config.json
+__pycache__/
+*.pyc
+state/
+*.log
+*.jsonl
+.env
+.venv/
+.pytest_cache/

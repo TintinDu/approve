@@ -1,0 +1,17 @@
+#!/bin/sh
+SELF="$0"
+while [ -L "$SELF" ]; do
+  DIR=$(cd "$(dirname "$SELF")" && pwd)
+  SELF=$(readlink "$SELF")
+  case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
+done
+ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
+for CANDIDATE in "$MR_APPROVER_PYTHON" python3.14 python3.13 python3.12 python3.11 python3; do
+  [ -n "$CANDIDATE" ] || continue
+  PY=$(command -v "$CANDIDATE") || continue
+  if "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+    exec "$PY" "$ROOT/approve.py" "$@"
+  fi
+done
+echo "approve : Python 3.11 ou plus introuvable (brew install python)" >&2
+exit 1

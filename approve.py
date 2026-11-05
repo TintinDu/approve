@@ -1,0 +1,1237 @@
+import argparse
+import asyncio
+import copy
+import fcntl
+import getpass
+import html
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import namedtuple
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+
+
+def resolve_paths(env, home):
+    app = Path(env.get("MR_APPROVER_HOME") or home / ".mr-approver")
+    return {
+        "app": app,
+        "hermes": Path(env.get("HERMES_HOME") or home / ".hermes"),
+        "config": Path(env["APPROVE_CONFIG"]) if env.get("APPROVE_CONFIG") else app / "config.json",
+    }
+
+
+_PATHS = resolve_paths(os.environ, Path.home())
+APP_DIR = _PATHS["app"]
+HERMES = _PATHS["hermes"]
+CONFIG_PATH = _PATHS["config"]
+STATE_DIR = APP_DIR / "state"
+STATE_PATH = STATE_DIR / "state.json"
+LOCK_PATH = STATE_DIR / "approve.lock"
+PAUSE_PATH = STATE_DIR / "PAUSE"
+JOURNAL_PATH = APP_DIR / "journal.jsonl"
+TOKEN_PATH = APP_DIR / "slack_token"
+TOKEN_ENV = "MR_APPROVER_SLACK_TOKEN"
+FAILURES_BEFORE_NOTIFY = 3
+DEFAULT_MAX_APPROVALS = 30
+PAUSE_POLL_SECONDS = 5
+STATUS_WINDOW_HOURS = 24
+EXIT_CAP_REACHED = 3
+DO_NOT_MERGE = re.compile(r"do[\s_-]*not[\s_-]*merge", re.IGNORECASE)
+SLACK_RETRIES = 3
+SLACK_PAUSE = 0.4
+MIN_PYTHON = (3, 11)
+SLACK_API = "https://slack.com/api/"
+SLACK_TIMEOUT = 30
+RETRY_AFTER_CAP = 30
+REQUIRED_SCOPES = ("search:read", "reactions:read", "reactions:write")
+SLACK_HINTS = {
+    "invalid_auth": "jeton refusé ou révoqué : relance approve --init pour en saisir un nouveau",
+    "not_authed": "aucun jeton envoyé : relance approve --init",
+    "token_revoked": "jeton révoqué : relance approve --init pour en saisir un nouveau",
+    "account_inactive": "compte Slack désactivé",
+    "missing_scope": "le jeton n'a pas tous les droits (" + ", ".join(REQUIRED_SCOPES) + ")",
+    "ratelimited": "Slack limite le débit : réessaie plus tard ou allonge --interval",
+}
+GITLAB_ONLY_NOTE = "Slack non configuré : mode GitLab seul (aucune réaction, pas de filtre « annoncée sur Slack »)"
+PLACEHOLDERS = {"gitlab.example.com", "UXXXXXXXXXX"}
+DEFAULT_CONFIG = {
+    "emoji": "lgtm",
+    "exclude_channels": [],
+    "interval_seconds": 300,
+    "rediscovery_minutes": 60,
+    "merged_grace_hours": 48,
+    "max_approvals_per_pass": DEFAULT_MAX_APPROVALS,
+    "slack_backend": "auto",
+    "slack_mcp": {
+        "url": "https://mcp.slack.com/mcp",
+        "oauth": {"redirect_port": 3118, "redirect_host": "localhost"},
+    },
+    "people": {},
+}
+Check = namedtuple("Check", "ok label detail hint")
+
+sys.path.insert(0, str(HERMES / "hermes-agent"))
+
+
+def log(msg):
+    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+
+
+def journal(event, **data):
+    JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    row = {"at": datetime.now().isoformat(timespec="seconds"), "event": event, **data}
+    with JOURNAL_PATH.open("a") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def notify(title, message):
+    if not shutil.which("osascript"):
+        return
+    script = f'display notification {json.dumps(message)} with title {json.dumps(title)}'
+    subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
+
+
+class ApprovalCapReached(Exception):
+    pass
+
+
+class Budget:
+    def __init__(self, cap):
+        self.cap = cap
+        self.used = 0
+
+    def take(self):
+        if self.used >= self.cap:
+            raise ApprovalCapReached(self.cap)
+        self.used += 1
+
+
+class GitLab:
+    def __init__(self, host):
+        self.host = host
+
+    def api(self, path, method="GET", fields=None, paginate=False):
+        cmd = ["glab", "api", "--hostname", self.host, "-X", method]
+        if paginate:
+            cmd.append("--paginate")
+        for k, v in (fields or {}).items():
+            cmd += ["-f", f"{k}={v}"]
+        cmd.append(path)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stdout + proc.stderr).strip()[:300])
+        return self._decode(proc.stdout, paginate)
+
+    @staticmethod
+    def _decode(raw, paginate):
+        if not paginate:
+            return json.loads(raw) if raw.strip() else None
+        decoder, pos, items = json.JSONDecoder(), 0, []
+        raw = raw.strip()
+        while pos < len(raw):
+            chunk, pos = decoder.raw_decode(raw, pos)
+            items += chunk
+            while pos < len(raw) and raw[pos].isspace():
+                pos += 1
+        return items
+
+    def open_mrs(self, author_id):
+        path = f"merge_requests?state=opened&scope=all&author_id={author_id}&per_page=100"
+        return self.api(path, paginate=True)
+
+    def mr(self, project, iid):
+        return self.api(f"projects/{project}/merge_requests/{iid}")
+
+    def approval_info(self, project, iid):
+        data = self.api(f"projects/{project}/merge_requests/{iid}/approvals")
+        approvers = {a["user"]["id"] for a in data["approved_by"]}
+        return approvers, bool(data.get("user_can_approve", True))
+
+    def approvers(self, project, iid):
+        return self.approval_info(project, iid)[0]
+
+    def approve(self, project, iid, sha):
+        return self.api(
+            f"projects/{project}/merge_requests/{iid}/approve", "POST", {"sha": sha}
+        )
+
+
+class HermesSlack:
+    def __init__(self, session):
+        self.session = session
+
+    async def call(self, tool, args):
+        last = None
+        for attempt in range(SLACK_RETRIES):
+            try:
+                result = await self.session.call_tool(tool, args)
+                text = result.content[0].text if result.content else ""
+                if result.is_error:
+                    raise RuntimeError(text[:300])
+                await asyncio.sleep(SLACK_PAUSE)
+                return json.loads(text)
+            except Exception as exc:
+                last = exc
+                await asyncio.sleep(2 ** attempt)
+        raise RuntimeError(f"{tool}: {last}")
+
+    async def whoami(self):
+        data = await self.call("slack_read_user_profile", {"response_format": "detailed"})
+        found = re.search(r"User ID: ([UW][A-Z0-9]+)", data.get("result", ""))
+        if not found:
+            raise RuntimeError("réponse Slack sans ID de membre")
+        return found.group(1)
+
+    async def search_mr(self, iid, mr_url_re):
+        data = await self.call(
+            "slack_search_public_and_private",
+            {"keywords": [f'"merge_requests/{iid}"'], "include_context": False, "limit": 20},
+        )
+        return parse_search(data.get("results", ""), mr_url_re)
+
+    async def reactors(self, channel_id, ts, emoji):
+        data = await self.call(
+            "slack_get_reactions", {"channel_id": channel_id, "message_ts": ts}
+        )
+        for line in data.get("result", "").splitlines():
+            if line.startswith(f":{emoji}:"):
+                return set(re.findall(r"\((U[A-Z0-9]+)\)", line))
+        return set()
+
+    async def react(self, channel_id, ts, emoji):
+        await self.call(
+            "slack_add_reaction", {"channel_id": channel_id, "message_ts": ts, "emoji": emoji}
+        )
+
+
+class NoSlack:
+    async def whoami(self):
+        return None
+
+    async def search_mr(self, iid, mr_url_re):
+        return []
+
+    async def reactors(self, channel_id, ts, emoji):
+        return set()
+
+    async def react(self, channel_id, ts, emoji):
+        return None
+
+
+class SlackError(RuntimeError):
+    def __init__(self, code, detail=""):
+        hint = SLACK_HINTS.get(code)
+        text = f"Slack : {code}" + (f" ({detail})" if detail else "") + (f" — {hint}" if hint else "")
+        super().__init__(text)
+        self.code = code
+
+
+class SlackWeb:
+    def __init__(self, token, base_url=SLACK_API):
+        self.token = token
+        self.base_url = base_url
+        self.scopes = None
+
+    def request(self, method, params=None, post=False):
+        body = urllib.parse.urlencode(params or {})
+        for attempt in range(SLACK_RETRIES):
+            last = attempt == SLACK_RETRIES - 1
+            url = self.base_url + method
+            if post:
+                req = urllib.request.Request(url, data=body.encode(), method="POST")
+            else:
+                req = urllib.request.Request(f"{url}?{body}" if body else url)
+            req.add_header("Authorization", f"Bearer {self.token}")
+            try:
+                with urllib.request.urlopen(req, timeout=SLACK_TIMEOUT) as resp:
+                    payload = json.loads(resp.read())
+                    scopes = resp.headers.get("x-oauth-scopes")
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and not last:
+                    time.sleep(min(int(exc.headers.get("Retry-After") or 1), RETRY_AFTER_CAP))
+                    continue
+                if exc.code >= 500 and not last:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise SlackError(f"http_{exc.code}") from exc
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                if not last:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"Slack injoignable : {exc}") from exc
+            if scopes is not None:
+                self.scopes = {name.strip() for name in scopes.split(",") if name.strip()}
+            if not payload.get("ok"):
+                needed = payload.get("needed")
+                raise SlackError(payload.get("error", "unknown"), f"droit manquant : {needed}" if needed else "")
+            return payload
+        raise RuntimeError("Slack : plus de tentatives")
+
+    async def call(self, method, params=None, post=False):
+        data = await asyncio.to_thread(self.request, method, params, post)
+        await asyncio.sleep(SLACK_PAUSE)
+        return data
+
+    async def whoami(self):
+        return (await self.call("auth.test", post=True))["user_id"]
+
+    async def search_mr(self, iid, mr_url_re):
+        data = await self.call(
+            "search.messages", {"query": f'"merge_requests/{iid}"', "count": 20, "sort": "timestamp"}
+        )
+        return parse_web_matches(data.get("messages", {}).get("matches", []), mr_url_re)
+
+    async def reactors(self, channel_id, ts, emoji):
+        data = await self.call("reactions.get", {"channel": channel_id, "timestamp": ts, "full": "true"})
+        for reaction in data.get("message", {}).get("reactions", []):
+            if reaction.get("name") == emoji:
+                return set(reaction.get("users", []))
+        return set()
+
+    async def react(self, channel_id, ts, emoji):
+        try:
+            await self.call("reactions.add", {"channel": channel_id, "timestamp": ts, "name": emoji}, post=True)
+        except SlackError as exc:
+            if exc.code != "already_reacted":
+                raise
+
+
+def parse_web_matches(matches, mr_url_re):
+    messages = []
+    for match in matches:
+        channel = match.get("channel") or {}
+        if match.get("bot_id") or match.get("subtype") == "bot_message":
+            continue
+        if not channel.get("id") or not match.get("ts"):
+            continue
+        text = html.unescape(match.get("text", ""))
+        messages.append(
+            {
+                "channel": channel.get("name", ""),
+                "channel_id": channel["id"],
+                "ts": match["ts"],
+                "urls": sorted(set(mr_url_re.findall(text))),
+            }
+        )
+    return messages
+
+
+def parse_search(text, mr_url_re):
+    messages = []
+    for block in re.split(r"### Result \d+ of \d+\n", text)[1:]:
+        channel = re.search(r"Channel: (.+?) \(ID: (\w+)\)", block)
+        ts = re.search(r"Message_ts: (\d+\.\d+)", block)
+        sender = re.search(r"From: (.*)", block)
+        if not channel or not ts or (sender and "[BOT]" in sender.group(1)):
+            continue
+        messages.append(
+            {
+                "channel": channel.group(1).lstrip("#"),
+                "channel_id": channel.group(2),
+                "ts": ts.group(1),
+                "urls": sorted(set(mr_url_re.findall(block))),
+            }
+        )
+    return messages
+
+
+def load_state():
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return {"mrs": {}}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(STATE_PATH)
+
+
+async def discover(slack, mr, entry, mr_url_re, now):
+    found = await slack.search_mr(mr["iid"], mr_url_re)
+    known = {(m["channel_id"], m["ts"]): m for m in entry.get("messages", [])}
+    for m in found:
+        if mr["web_url"] in m["urls"]:
+            known[(m["channel_id"], m["ts"])] = m
+    entry["messages"] = list(known.values())
+    entry["last_search"] = now
+
+
+def needs_discovery(entry, person, cfg, now):
+    stale = now - entry.get("last_search", 0) > cfg["rediscovery_minutes"] * 60
+    if not entry.get("messages"):
+        return True
+    return stale or "last_search" not in entry
+
+
+def settled(entry, cfg, now):
+    if not entry.get("messages"):
+        return False
+    ttl = cfg["rediscovery_minutes"] * 60
+    if now - entry.get("last_search", 0) > ttl:
+        return False
+    reactions = entry.get("reactions", {})
+    for msg in entry["messages"]:
+        if msg["channel"] in cfg["exclude_channels"] or msg["channel_id"] in cfg["exclude_channels"]:
+            continue
+        done = reactions.get(f"{msg['channel_id']}:{msg['ts']}")
+        if not done or now - done["at"] >= ttl:
+            return False
+    return True
+
+
+def mr_key(mr):
+    return f"{mr['project_id']}!{mr['iid']}"
+
+
+def approve_mr(gl, mr, me_id, dry, budget=None):
+    fresh = gl.mr(mr["project_id"], mr["iid"])
+    if fresh["state"] != "opened" or fresh.get("draft"):
+        return "skipped", fresh["sha"]
+    if DO_NOT_MERGE.search(fresh.get("title", "")):
+        return "do_not_merge", fresh["sha"]
+    approvers, can_approve = gl.approval_info(mr["project_id"], mr["iid"])
+    if me_id in approvers:
+        return "already", fresh["sha"]
+    if not can_approve:
+        return "not_allowed", fresh["sha"]
+    if budget is not None:
+        budget.take()
+    if dry:
+        return "would_approve", fresh["sha"]
+    gl.approve(mr["project_id"], mr["iid"], fresh["sha"])
+    if me_id not in gl.approvers(mr["project_id"], mr["iid"]):
+        raise RuntimeError("approval not visible after POST")
+    return "approved", fresh["sha"]
+
+
+def bundle_fully_approved(gl, urls, me_id, mr_url_re, cache):
+    for url in urls:
+        if url not in cache:
+            m = re.match(r"https://[^/]+/(.+)/-/merge_requests/(\d+)$", url)
+            project = m.group(1).replace("/", "%2F")
+            try:
+                cache[url] = me_id in gl.approvers(project, m.group(2))
+            except RuntimeError:
+                cache[url] = False
+        if not cache[url]:
+            return False
+    return True
+
+
+async def reconcile_reactions(slack, gl, entry, cfg, me, mr_url_re, dry, now, cache, stats):
+    emoji = cfg["emoji"]
+    reactions = entry.setdefault("reactions", {})
+    for msg in entry.get("messages", []):
+        key = f"{msg['channel_id']}:{msg['ts']}"
+        if msg["channel"] in cfg["exclude_channels"] or msg["channel_id"] in cfg["exclude_channels"]:
+            continue
+        done = reactions.get(key)
+        if done and now - done["at"] < cfg["rediscovery_minutes"] * 60:
+            continue
+        if ("msg", key) in cache:
+            reactions[key] = cache[("msg", key)]
+            continue
+        if not bundle_fully_approved(gl, msg["urls"], me["gitlab_id"], mr_url_re, cache):
+            continue
+        present = me["slack_id"] in await slack.reactors(msg["channel_id"], msg["ts"], emoji)
+        if not present:
+            if dry:
+                stats["would_react"] += 1
+                log(f"  DRY réaction :{emoji}: sur {msg['channel']} {msg['ts']}")
+                continue
+            await slack.react(msg["channel_id"], msg["ts"], emoji)
+            if me["slack_id"] not in await slack.reactors(msg["channel_id"], msg["ts"], emoji):
+                raise RuntimeError(f"reaction not visible on {key}")
+            stats["reacted"] += 1
+            journal("reaction_added", channel=msg["channel"], ts=msg["ts"], urls=msg["urls"])
+            log(f"  réaction :{emoji}: ajoutée sur {msg['channel']} {msg['ts']}")
+        reactions[key] = cache[("msg", key)] = {"at": now}
+
+
+async def process_person(name, person, cfg, gl, slack, state, dry, budget=None):
+    me = cfg["me"]
+    mr_url_re = re.compile(
+        r"(https://" + re.escape(cfg["gitlab_host"]) + r"/[\w.\-/]+?/-/merge_requests/\d+)"
+    )
+    stats = dict.fromkeys(["open", "approved", "already", "would_approve", "skipped", "gated",
+                           "reacted", "would_react", "errors", "not_allowed", "do_not_merge"], 0)
+    now = time.time()
+    mrs = [m for m in gl.open_mrs(person["gitlab_id"]) if not m.get("draft")]
+    stats["open"] = len(mrs)
+    bundle_cache = {}
+    for mr in mrs:
+        key = mr_key(mr)
+        if DO_NOT_MERGE.search(mr.get("title", "")):
+            stats["do_not_merge"] += 1
+            continue
+        entry = state["mrs"].setdefault(key, {})
+        entry["author_id"] = person["gitlab_id"]
+        entry["last_seen"] = now
+        try:
+            if needs_discovery(entry, person, cfg, now):
+                await discover(slack, mr, entry, mr_url_re, now)
+        except RuntimeError as exc:
+            stats["errors"] += 1
+            log(f"  recherche Slack en échec pour {key}: {exc}")
+            if person["require_announcement"]:
+                continue
+        if person["require_announcement"] and not entry.get("messages"):
+            stats["gated"] += 1
+            continue
+        try:
+            outcome, sha = approve_mr(gl, mr, me["gitlab_id"], dry, budget)
+            stats[outcome] += 1
+            entry["sha"] = sha
+            if outcome == "approved":
+                bundle_cache[mr["web_url"]] = True
+            if outcome in ("approved", "would_approve"):
+                journal("approval", mr=key, sha=sha, url=mr["web_url"], dry=dry)
+                log(f"  {'DRY approuverait' if dry else 'approuvée'} {key} {mr['title'][:60]}")
+            if outcome in ("approved", "already", "would_approve"):
+                await reconcile_reactions(
+                    slack, gl, entry, cfg, me, mr_url_re, dry or outcome == "would_approve",
+                    now, bundle_cache, stats,
+                )
+        except RuntimeError as exc:
+            stats["errors"] += 1
+            journal("error", mr=key, error=str(exc))
+            log(f"  erreur sur {key}: {exc}")
+    await process_merged(person, cfg, gl, slack, state, dry, mr_url_re, bundle_cache, stats, now,
+                         {mr_key(m) for m in mrs})
+    return stats
+
+
+async def process_merged(person, cfg, gl, slack, state, dry, mr_url_re, cache, stats, now, open_keys):
+    me = cfg["me"]
+    grace = cfg.get("merged_grace_hours", 48) * 3600
+    for key, entry in state["mrs"].items():
+        if key in open_keys or "sha" not in entry:
+            continue
+        entry.setdefault("last_seen", now)
+        if now - entry["last_seen"] > grace or entry.get("author_id", person["gitlab_id"]) != person["gitlab_id"]:
+            continue
+        if settled(entry, cfg, now):
+            continue
+        project, iid = key.split("!")
+        try:
+            fresh = gl.mr(project, iid)
+            if fresh["author"]["id"] != person["gitlab_id"]:
+                entry["author_id"] = fresh["author"]["id"]
+                continue
+            entry["author_id"] = person["gitlab_id"]
+            if fresh["state"] != "merged" or me["gitlab_id"] not in gl.approvers(project, iid):
+                continue
+            if needs_discovery(entry, person, cfg, now):
+                await discover(slack, fresh, entry, mr_url_re, now)
+            await reconcile_reactions(slack, gl, entry, cfg, me, mr_url_re, dry, now, cache, stats)
+        except RuntimeError as exc:
+            stats["errors"] += 1
+            journal("error", mr=key, error=str(exc))
+            log(f"  erreur sur MR mergée {key}: {exc}")
+
+
+def load_env():
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(HERMES / ".env")
+
+
+def load_slack_token():
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    if token:
+        return token
+    try:
+        return TOKEN_PATH.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def save_slack_token(token):
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_PATH.write_text(token.strip() + "\n")
+    TOKEN_PATH.chmod(0o600)
+
+
+def hermes_available():
+    return (HERMES / "hermes-agent").is_dir() and (HERMES / "mcp-tokens" / "slack.json").is_file()
+
+
+def resolve_backend(cfg):
+    choice = cfg.get("slack_backend", "auto")
+    if choice in ("token", "hermes"):
+        return choice
+    if load_slack_token():
+        return "token"
+    if hermes_available():
+        return "hermes"
+    return None
+
+
+def ensure_hermes_python():
+    try:
+        import mcp  # noqa: F401
+        from tools import mcp_oauth  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.environ.get("MR_APPROVER_REEXEC"):
+        return
+    pythons = sorted(HERMES.glob("installs/*/environments/*/venv/bin/python"),
+                     key=lambda path: path.stat().st_mtime, reverse=True)
+    if pythons:
+        os.environ["MR_APPROVER_REEXEC"] = "1"
+        os.execv(str(pythons[0]), [str(pythons[0]), *sys.argv])
+
+
+@asynccontextmanager
+async def hermes_session(cfg):
+    load_env()
+    try:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+        from tools.mcp_oauth import build_oauth_auth, suppress_interactive_oauth
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Hermes introuvable ou incomplet ({exc}). Lance : approve --doctor"
+        ) from exc
+    if "SLACK_MCP_CLIENT_ID" not in os.environ:
+        raise RuntimeError("SLACK_MCP_CLIENT_ID absent de l'environnement. Lance : approve --doctor")
+    slack_cfg = cfg["slack_mcp"]
+    oauth = {**slack_cfg["oauth"], "client_id": os.environ["SLACK_MCP_CLIENT_ID"]}
+    with suppress_interactive_oauth():
+        auth = build_oauth_auth("slack", slack_cfg["url"], oauth)
+        async with create_mcp_http_client(auth=auth) as http:
+            async with streamable_http_client(slack_cfg["url"], http_client=http) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    yield HermesSlack(session)
+
+
+@asynccontextmanager
+async def slack_session(cfg):
+    backend = resolve_backend(cfg)
+    if backend == "token":
+        token = load_slack_token()
+        if not token:
+            raise RuntimeError("Jeton Slack introuvable. Lance : approve --init")
+        yield SlackWeb(token)
+    elif backend == "hermes":
+        async with hermes_session(cfg) as slack:
+            yield slack
+    else:
+        yield NoSlack()
+
+
+async def run_pass(cfg, names, dry, state, max_approvals):
+    gl = GitLab(cfg["gitlab_host"])
+    errors = 0
+    budget = Budget(max_approvals)
+    async with slack_session(cfg) as slack:
+        if not cfg["me"].get("slack_id"):
+            cfg["me"]["slack_id"] = await slack.whoami()
+        parts = []
+        for name in names:
+            s = await process_person(name, cfg["people"][name], cfg, gl, slack, state, dry, budget)
+            errors += s["errors"]
+            parts.append(
+                f"{name}: {s['open']} ouvertes, {s['approved'] + s['would_approve']} "
+                f"approuvées, {s['already']} déjà, {s['gated']} sans annonce, "
+                f"{s['reacted'] + s['would_react']} réactions"
+                + (f", {s['do_not_merge']} DO NOT MERGE" if s["do_not_merge"] else "")
+                + (f", {s['not_allowed']} non approuvables" if s["not_allowed"] else "")
+                + (f", {s['errors']} erreurs" if s["errors"] else "")
+            )
+        log(" | ".join(parts) + (" [simulation]" if dry else ""))
+    return errors
+
+
+def resolve_people(tokens, cfg):
+    gl = GitLab(cfg["gitlab_host"])
+    resolved = {}
+    for token in tokens:
+        name, _, flag = token.partition(":")
+        if flag not in ("", "all"):
+            sys.exit(f"{token}: suffixe inconnu (seul ':all' existe)")
+        known = cfg.get("people", {})
+        if name in known and not flag:
+            resolved[name] = known[name]
+            continue
+        users = [u for u in gl.api(f"users?search={name}&active=true&per_page=20") if u["state"] == "active"]
+        exact = [u for u in users if u["username"] == name]
+        users = exact or users
+        if len(users) != 1:
+            lines = "\n".join(f"  {u['username']} ({u['name']})" for u in users) or "  aucun"
+            sys.exit(f"{name}: {len(users)} correspondances, précise le username :\n{lines}")
+        resolved[name] = {
+            "gitlab_id": users[0]["id"],
+            "require_announcement": known.get(name, {}).get("require_announcement", True)
+            and flag != "all",
+            "label": users[0]["name"],
+        }
+    return resolved
+
+
+def contains(exc, kind):
+    if isinstance(exc, kind):
+        return True
+    return isinstance(exc, BaseExceptionGroup) and any(contains(e, kind) for e in exc.exceptions)
+
+
+def is_interrupt(exc):
+    return contains(exc, KeyboardInterrupt)
+
+
+def describe(exc):
+    if isinstance(exc, BaseExceptionGroup):
+        return "; ".join(describe(e) for e in exc.exceptions)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def lock_held():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+
+
+def set_pause(on):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if on:
+        PAUSE_PATH.touch()
+    else:
+        PAUSE_PATH.unlink(missing_ok=True)
+
+
+def read_journal():
+    try:
+        lines = JOURNAL_PATH.read_text().splitlines()
+    except OSError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
+
+
+def status_report(now=None):
+    now = now or datetime.now()
+    since = now.timestamp() - STATUS_WINDOW_HOURS * 3600
+    recent = [r for r in read_journal() if datetime.fromisoformat(r["at"]).timestamp() >= since]
+    live = [r for r in recent if not r.get("dry")]
+    count = lambda event, rows=live: sum(1 for r in rows if r["event"] == event)
+    passes = [r for r in read_journal() if r["event"] in ("pass", "pass_failed")]
+    last = passes[-1] if passes else None
+    lines = [
+        f"approve : {'en cours' if lock_held() else 'arrêté'}",
+        f"pause : {'oui' if PAUSE_PATH.exists() else 'non'}",
+        f"dernière passe : {last['at'] if last else 'aucune'}"
+        + ("" if not last else " (échec)" if last["event"] == "pass_failed"
+           else f" ({last['errors']} erreur(s))"),
+        f"{STATUS_WINDOW_HOURS} dernières heures : {count('approval')} approbations, "
+        f"{count('reaction_added')} réactions, {count('error', recent) + count('pass_failed', recent)} erreurs",
+    ]
+    if count("cap_reached", recent):
+        lines.append("plafond d'approbations atteint : relancer avec --max-approvals N")
+    return "\n".join(lines)
+
+
+def acquire_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("approve tourne déjà (verrou pris), une seule instance à la fois.")
+    return handle
+
+
+def with_defaults(raw):
+    merged = {**copy.deepcopy(DEFAULT_CONFIG), **raw}
+    merged["me"] = dict(raw.get("me", {}))
+    return merged
+
+
+def validate_config(cfg):
+    problems = []
+    host = cfg.get("gitlab_host")
+    if not host or host in PLACEHOLDERS:
+        problems.append("gitlab_host : indique le serveur GitLab (ex. gitlab.macompagnie.com)")
+    me = cfg.get("me", {})
+    gitlab_id = me.get("gitlab_id")
+    if not isinstance(gitlab_id, int) or isinstance(gitlab_id, bool) or gitlab_id <= 0:
+        problems.append("me.gitlab_id : ton identifiant numérique GitLab (approve --init le trouve)")
+    slack_id = me.get("slack_id")
+    if slack_id is not None and (
+        not isinstance(slack_id, str) or slack_id in PLACEHOLDERS or not re.fullmatch(r"[UW][A-Z0-9]{6,}", slack_id)
+    ):
+        problems.append("me.slack_id : ID de membre Slack de la forme U0123ABCD (ou supprime la ligne, il se déduit du jeton)")
+    return problems
+
+
+def auto_config(host=None):
+    hosts = [host] if host else detect_glab_hosts()
+    if len(hosts) != 1:
+        return None
+    try:
+        me = GitLab(hosts[0]).api("user")
+    except RuntimeError:
+        return None
+    return with_defaults({"gitlab_host": hosts[0], "me": {"gitlab_id": me["id"]}})
+
+
+def load_config(host=None):
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+    except FileNotFoundError:
+        cfg = auto_config(host)
+        if cfg:
+            return cfg, True
+        sys.exit(
+            f"Pas de configuration ({CONFIG_PATH}) et le serveur GitLab n'a pas pu être deviné.\n"
+            "Lance : approve --init   (ou précise --host <serveur> si glab est connecté à plusieurs)"
+        )
+    except ValueError as exc:
+        sys.exit(f"{CONFIG_PATH} n'est pas un JSON valide : {exc}")
+    cfg = with_defaults(raw)
+    problems = validate_config(cfg)
+    if problems:
+        listing = "\n".join(f"  - {p}" for p in problems)
+        sys.exit(f"Configuration incomplète ({CONFIG_PATH}) :\n{listing}\nLance : approve --doctor")
+    return cfg, False
+
+
+def gitlab_only_refusal(people):
+    gated = [name for name, person in people.items() if person["require_announcement"]]
+    if not gated:
+        return None
+    return (
+        "Sans accès Slack, l'outil ne peut pas savoir quelles MR sont annoncées.\n"
+        "Pour approuver TOUTES les MR ouvertes de la personne, écris : "
+        + " ".join(f"approve {name}:all" for name in gated)
+        + "\nPour le mode « annoncées sur Slack » et les réactions : approve --init"
+    )
+
+
+def detect_hosts(text):
+    return sorted(set(re.findall(r"Logged in to (\S+) as", text)))
+
+
+def detect_glab_hosts():
+    if not shutil.which("glab"):
+        return []
+    proc = subprocess.run(["glab", "auth", "status"], capture_output=True, text=True)
+    return detect_hosts(proc.stdout + proc.stderr)
+
+
+def glab_hosts():
+    if not shutil.which("glab"):
+        sys.exit("glab n'est pas installé. Installe-le (brew install glab), puis : glab auth login")
+    return detect_glab_hosts()
+
+
+def choose_host(hosts, ask=input, interactive=None):
+    interactive = sys.stdin.isatty() if interactive is None else interactive
+    if not hosts:
+        sys.exit("Aucun serveur GitLab connecté dans glab. Lance : glab auth login --hostname <ton-gitlab>")
+    if len(hosts) == 1:
+        return hosts[0]
+    if not interactive:
+        sys.exit("Plusieurs serveurs GitLab connectés, précise --host <serveur> :\n  " + "\n  ".join(hosts))
+    for number, host in enumerate(hosts, 1):
+        print(f"  {number}. {host}")
+    answer = ask("Numéro du serveur GitLab à utiliser : ").strip()
+    if not answer.isdigit() or not 1 <= int(answer) <= len(hosts):
+        sys.exit("Choix invalide.")
+    return hosts[int(answer) - 1]
+
+
+async def fetch_slack_id(cfg=None):
+    async with slack_session(cfg or with_defaults({})) as slack:
+        return await slack.whoami()
+
+
+def ask_excluded(interactive=None, ask=input):
+    interactive = sys.stdin.isatty() if interactive is None else interactive
+    if not interactive:
+        return []
+    answer = ask(
+        "Canaux Slack où ne JAMAIS réagir, noms séparés par des virgules (Entrée = aucun) : "
+    )
+    return [name.strip().lstrip("#") for name in answer.split(",") if name.strip()]
+
+
+def build_config(host, gitlab_id, slack_id, excluded, backend="auto"):
+    defaults = copy.deepcopy(DEFAULT_CONFIG)
+    defaults["exclude_channels"] = excluded
+    defaults["slack_backend"] = backend
+    me = {"gitlab_id": gitlab_id}
+    if slack_id:
+        me["slack_id"] = slack_id
+    return {"gitlab_host": host, "me": me, **defaults}
+
+
+def write_config(cfg, path, force=False):
+    if path.exists() and not force:
+        raise FileExistsError(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    path.chmod(0o600)
+
+
+def slack_token_help():
+    manifest = Path(__file__).resolve().parent / "slack-app-manifest.json"
+    return f"""
+Pour lire et réagir aux messages Slack, l'outil a besoin d'un jeton à toi (une fois pour toutes) :
+  1. Ouvre https://api.slack.com/apps puis « Create New App » > « From an app manifest ».
+  2. Choisis ton espace de travail et colle le contenu de ce fichier :
+       {manifest}
+  3. Clique « Install to Workspace » (ton administrateur Slack peut devoir l'approuver).
+  4. Menu « OAuth & Permissions » : copie le « User OAuth Token » (il commence par xoxp-).
+"""
+
+
+def prompt_token(ask=getpass.getpass):
+    return ask("Colle ton jeton Slack (rien ne s'affiche pendant la saisie) : ").strip()
+
+
+def check_token_scopes(slack):
+    if slack.scopes is None:
+        return []
+    return [scope for scope in REQUIRED_SCOPES if scope not in slack.scopes]
+
+
+def init_slack_token(interactive, ask_token=prompt_token):
+    token = load_slack_token()
+    from_env = bool(os.environ.get(TOKEN_ENV, "").strip())
+    if not token:
+        if not interactive:
+            return None, "Aucun jeton Slack. Lance approve --init dans un terminal, ou définis " + TOKEN_ENV
+        print(slack_token_help())
+        token = ask_token()
+        if not token:
+            return None, "Aucun jeton saisi."
+    slack = SlackWeb(token)
+    try:
+        slack_id = asyncio.run(slack.whoami())
+    except Exception as exc:
+        return None, f"Ce jeton ne fonctionne pas : {describe(exc)}"
+    missing = check_token_scopes(slack)
+    if missing:
+        return None, ("Le jeton n'a pas tous les droits. Il manque : " + ", ".join(missing)
+                      + "\nAjoute-les dans « OAuth & Permissions » (User Token Scopes), réinstalle l'app et recopie le jeton.")
+    if not from_env:
+        save_slack_token(token)
+    return slack_id, None
+
+
+def cmd_init(args):
+    if CONFIG_PATH.exists() and not args.force:
+        print(f"Une configuration existe déjà : {CONFIG_PATH}")
+        print("Relance avec --force pour la remplacer (elle sera écrasée).")
+        return 1
+    host = args.host or choose_host(glab_hosts())
+    try:
+        me = GitLab(host).api("user")
+    except RuntimeError as exc:
+        print(f"glab ne peut pas se connecter à {host} : {exc}")
+        print(f"Lance : glab auth login --hostname {host}")
+        return 1
+    print(f"GitLab : {host}, connecté en tant que {me['username']} (id {me['id']})")
+
+    interactive = sys.stdin.isatty()
+    use_hermes = args.hermes or (not args.token and not load_slack_token() and hermes_available())
+    backend = "hermes" if use_hermes else "auto"
+    slack_id = args.slack_id
+    if use_hermes:
+        if not args.hermes:
+            print("Hermes détecté : j'utilise ton autorisation Slack existante (pas de jeton à créer).")
+        ensure_hermes_python()
+        if not slack_id:
+            try:
+                slack_id = asyncio.run(fetch_slack_id(with_defaults({"slack_backend": "hermes"})))
+            except Exception as exc:
+                print(f"Impossible de lire ton ID Slack via Hermes : {describe(exc)}")
+                print("Donne-le à la main : approve --init --hermes --slack-id U0123ABCD")
+                return 1
+    else:
+        slack_id, error = init_slack_token(interactive)
+        if error:
+            print(error)
+            return 1
+    print(f"Slack : connecté, ton ID de membre est {slack_id}")
+    cfg = build_config(host, me["id"], slack_id, ask_excluded(), backend)
+    write_config(cfg, CONFIG_PATH, force=True)
+    print(f"\nConfiguration écrite : {CONFIG_PATH}")
+    print("Étape suivante : approve --doctor")
+    return 0
+
+
+def check_python():
+    ok = sys.version_info >= MIN_PYTHON
+    version = ".".join(str(n) for n in sys.version_info[:3])
+    return Check(ok, "Python 3.11 ou plus", version, "Installe Python 3.11+ (brew install python)")
+
+
+def check_config(host=None):
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+    except FileNotFoundError:
+        cfg = auto_config(host)
+        if cfg:
+            return Check(True, "Configuration", f"aucun fichier : détectée depuis glab ({cfg['gitlab_host']})", ""), cfg
+        return Check(False, "Configuration", f"{CONFIG_PATH} absent",
+                     "Lance : approve --init (ou approve --init --host <serveur> si plusieurs)"), None
+    except ValueError as exc:
+        return Check(False, "Configuration", f"JSON invalide : {exc}", f"Corrige {CONFIG_PATH} ou relance approve --init --force"), None
+    cfg = with_defaults(raw)
+    problems = validate_config(cfg)
+    if problems:
+        return Check(False, "Configuration", "; ".join(problems), f"Édite {CONFIG_PATH}"), None
+    return Check(True, "Configuration", str(CONFIG_PATH), ""), cfg
+
+
+def check_glab(cfg):
+    if not shutil.which("glab"):
+        return Check(False, "glab installé", "introuvable", "brew install glab")
+    host = cfg["gitlab_host"]
+    try:
+        me = GitLab(host).api("user")
+    except RuntimeError as exc:
+        return Check(False, f"glab connecté à {host}", str(exc)[:120], f"glab auth login --hostname {host}")
+    if me["id"] != cfg["me"]["gitlab_id"]:
+        return Check(False, f"glab connecté à {host}", f"compte {me['username']} (id {me['id']}) ≠ me.gitlab_id {cfg['me']['gitlab_id']}",
+                     "Corrige me.gitlab_id ou relance approve --init --force")
+    return Check(True, f"glab connecté à {host}", f"compte {me['username']}", "")
+
+
+def check_hermes():
+    checks = []
+    agent = HERMES / "hermes-agent"
+    checks.append(Check(agent.is_dir(), "Hermes installé", str(agent),
+                        "Installe Hermes, ou définis HERMES_HOME si ce n'est pas ~/.hermes"))
+    try:
+        import mcp  # noqa: F401
+        from tools import mcp_oauth  # noqa: F401
+        importable, detail = True, "modules mcp et mcp_oauth trouvés"
+    except ImportError as exc:
+        importable, detail = False, str(exc)
+    checks.append(Check(importable, "Python de Hermes utilisé", detail,
+                        "Lance approve via bin/approve (il choisit le Python de Hermes)"))
+    load_env()
+    checks.append(Check("SLACK_MCP_CLIENT_ID" in os.environ, "SLACK_MCP_CLIENT_ID défini",
+                        str(HERMES / ".env"), "Ajoute SLACK_MCP_CLIENT_ID=... dans ~/.hermes/.env"))
+    token = HERMES / "mcp-tokens" / "slack.json"
+    checks.append(Check(token.is_file(), "Slack autorisé dans Hermes", str(token),
+                        "Autorise Slack dans Hermes (connexion MCP Slack), puis relance"))
+    return checks
+
+
+async def check_slack(cfg):
+    try:
+        found = await fetch_slack_id(cfg)
+    except Exception as exc:
+        return Check(False, "Slack répond", describe(exc)[:160], "Ré-autorise Slack dans Hermes")
+    expected = cfg["me"].get("slack_id")
+    if expected and found != expected:
+        return Check(False, "Slack répond", f"connecté en {found} ≠ me.slack_id {expected}",
+                     "Corrige me.slack_id ou relance approve --init --force")
+    return Check(True, "Slack répond", f"connecté en {found}", "")
+
+
+def check_token_present():
+    where = "variable " + TOKEN_ENV if os.environ.get(TOKEN_ENV, "").strip() else str(TOKEN_PATH)
+    return Check(bool(load_slack_token()), "Jeton Slack présent", where, "Lance : approve --init")
+
+
+async def check_slack_token(cfg):
+    slack = SlackWeb(load_slack_token())
+    try:
+        found = await slack.whoami()
+    except Exception as exc:
+        return Check(False, "Slack accepte le jeton", describe(exc)[:160], "Relance approve --init pour saisir un nouveau jeton")
+    missing = check_token_scopes(slack)
+    if missing:
+        return Check(False, "Droits du jeton Slack", "manque : " + ", ".join(missing),
+                     "Ajoute-les (User Token Scopes), réinstalle l'app Slack, puis approve --init --force")
+    expected = cfg["me"].get("slack_id")
+    if expected and found != expected:
+        return Check(False, "Slack accepte le jeton", f"connecté en {found} ≠ me.slack_id {expected}",
+                     "Supprime me.slack_id de la config (il se déduit du jeton) ou relance approve --init --force")
+    return Check(True, "Slack accepte le jeton", f"connecté en {found}, droits complets", "")
+
+
+def print_check(check):
+    print(f"  {'✓' if check.ok else '✗'} {check.label}" + (f" — {check.detail}" if check.detail else ""))
+    if not check.ok:
+        print(f"      → {check.hint}")
+
+
+def cmd_doctor(host=None):
+    print("Vérification de l'installation\n")
+    results = [check_python()]
+    notes = []
+    config_check, cfg = check_config(host)
+    results.append(config_check)
+    if cfg:
+        results.append(check_glab(cfg))
+    backend = resolve_backend(cfg) if cfg else None
+    if cfg and backend == "token":
+        presence = check_token_present()
+        results.append(presence)
+        if presence.ok:
+            results.append(asyncio.run(check_slack_token(cfg)))
+    elif cfg and backend == "hermes":
+        ensure_hermes_python()
+        hermes = check_hermes()
+        results.extend(hermes)
+        if all(c.ok for c in hermes):
+            results.append(asyncio.run(check_slack(cfg)))
+    elif cfg:
+        results.append(Check(True, "Accès Slack", "non configuré : mode GitLab seul (approve username:all)", ""))
+        notes.append("Pour les réactions et le mode « annoncées sur Slack » : approve --init")
+    for check in results:
+        print_check(check)
+    for note in notes:
+        print(f"  ℹ {note}")
+    failed = sum(1 for c in results if not c.ok)
+    if failed:
+        print(f"\n{failed} problème(s) à corriger.")
+        return 1
+    print("\nTout est prêt. Essaie : approve <username>:all --dry-run --once")
+    return 0
+
+
+def build_parser(interval_default=None):
+    parser = argparse.ArgumentParser(
+        prog="approve",
+        description="Approuve les merge requests GitLab de collègues et réagit à leur annonce Slack.",
+        epilog="Premiers pas : approve --init, puis approve --doctor, puis approve <username> --dry-run --once",
+    )
+    parser.add_argument("people", nargs="*", metavar="username",
+                        help="username GitLab (ou raccourci de la config) ; 'username:all' = toutes ses MR, même sans annonce Slack")
+    parser.add_argument("--init", action="store_true", help="crée la configuration en la détectant")
+    parser.add_argument("--doctor", action="store_true", help="vérifie l'installation et dit quoi corriger")
+    parser.add_argument("--status", action="store_true", help="état de l'outil et bilan des 24 dernières heures")
+    parser.add_argument("--pause", action="store_true", help="met la boucle en pause")
+    parser.add_argument("--resume", action="store_true", help="reprend après une pause")
+    parser.add_argument("--dry-run", action="store_true", help="simulation : n'écrit rien")
+    parser.add_argument("--once", action="store_true", help="une seule passe puis arrêt")
+    parser.add_argument("--interval", type=int, help="secondes entre deux passes (défaut : config)")
+    parser.add_argument("--max-approvals", type=int, help="plafond d'approbations par passe (défaut : config)")
+    parser.add_argument("--host", help="serveur GitLab à utiliser (si glab est connecté à plusieurs)")
+    parser.add_argument("--hermes", action="store_true", help="avec --init : utiliser l'autorisation Slack de Hermes (choisi tout seul si Hermes est détecté et qu'il n'y a pas de jeton)")
+    parser.add_argument("--token", action="store_true", help="avec --init : utiliser un jeton Slack même si Hermes est installé")
+    parser.add_argument("--slack-id", help="avec --init --hermes : ton ID de membre Slack, si la détection échoue")
+    parser.add_argument("--force", action="store_true", help="avec --init : remplace la config existante")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.init:
+        return cmd_init(args)
+    if args.doctor:
+        return cmd_doctor(args.host)
+    if args.pause or args.resume:
+        set_pause(args.pause)
+        print("en pause" if args.pause else "reprise")
+        return 0
+    if args.status:
+        print(status_report())
+        return 0
+    if not args.people:
+        parser.error("indique au moins un username (ou --init, --doctor, --status, --pause, --resume)")
+
+    cfg, auto = load_config(args.host)
+    interval = args.interval or cfg["interval_seconds"]
+    max_approvals = args.max_approvals or cfg["max_approvals_per_pass"]
+    backend = resolve_backend(cfg)
+    if backend == "hermes":
+        ensure_hermes_python()
+    cfg["people"] = resolve_people(args.people, cfg)
+    args.people = list(cfg["people"])
+    if backend is None:
+        refusal = gitlab_only_refusal(cfg["people"])
+        if refusal:
+            sys.exit(refusal)
+    lock = acquire_lock()
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    state = load_state()
+    failures, notified, exit_code = 0, False, 0
+    mode = "simulation (aucune écriture)" if args.dry_run else "LIVE (approbations + réactions)"
+    if auto:
+        log(f"Aucune config : serveur {cfg['gitlab_host']} et compte détectés depuis glab")
+    if backend is None:
+        log(GITLAB_ONLY_NOTE)
+    log(f"approve {' '.join(args.people)} — {mode} — toutes les {interval}s, "
+        f"plafond {max_approvals} approbations/passe — Ctrl-C pour arrêter")
+    try:
+        while True:
+            if PAUSE_PATH.exists():
+                log("en pause (approve --resume pour reprendre)")
+                while PAUSE_PATH.exists():
+                    time.sleep(PAUSE_POLL_SECONDS)
+                log("reprise")
+            try:
+                errors = asyncio.run(run_pass(cfg, args.people, args.dry_run, state, max_approvals))
+                save_state(state)
+                failed = errors > 0
+                journal("pass", errors=errors, people=args.people, dry=args.dry_run)
+            except BaseException as exc:
+                if is_interrupt(exc):
+                    raise KeyboardInterrupt from None
+                if contains(exc, ApprovalCapReached):
+                    save_state(state)
+                    journal("cap_reached", cap=max_approvals, dry=args.dry_run)
+                    log(f"plafond de {max_approvals} approbations atteint dans une passe : arrêt. "
+                        "Vérifie le journal, puis relance avec --max-approvals N si c'est voulu.")
+                    notify("approve", f"plafond de {max_approvals} approbations atteint, arrêté")
+                    exit_code = EXIT_CAP_REACHED
+                    break
+                if not isinstance(exc, Exception):
+                    raise
+                failed = True
+                log(f"passe en échec: {describe(exc)}")
+                journal("pass_failed", error=describe(exc))
+            failures = failures + 1 if failed else 0
+            if failures >= FAILURES_BEFORE_NOTIFY and not notified:
+                notify("approve", f"{failures} passes en échec d'affilée, voir la console")
+                notified = True
+            if not failed:
+                notified = False
+            if args.once:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        save_state(state)
+        log("arrêté.")
+    finally:
+        lock.close()
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

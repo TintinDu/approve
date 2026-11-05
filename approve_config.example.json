@@ -1,0 +1,21 @@
+{
+  "gitlab_host": "gitlab.example.com",
+  "me": {
+    "gitlab_id": 0
+  },
+  "emoji": "lgtm",
+  "exclude_channels": [],
+  "interval_seconds": 300,
+  "rediscovery_minutes": 60,
+  "merged_grace_hours": 48,
+  "max_approvals_per_pass": 30,
+  "slack_backend": "auto",
+  "slack_mcp": {
+    "url": "https://mcp.slack.com/mcp",
+    "oauth": {
+      "redirect_port": 3118,
+      "redirect_host": "localhost"
+    }
+  },
+  "people": {}
+}
