@@ -42,6 +42,7 @@ def make_msg(iids, channel="front", channel_id="C1", ts="1.1"):
 
 class FakeGitLab:
     def __init__(self, mrs, approved_by_me=(), users=None, cannot_approve=()):
+        self.calls = []
         self.cannot_approve = set(cannot_approve)
         self.mrs = {m["iid"]: m for m in mrs}
         self.approvals = {i: {ME_GITLAB} for i in approved_by_me}
@@ -52,21 +53,27 @@ class FakeGitLab:
         return int(iid)
 
     def open_mrs(self, author_id):
+        self.calls.append("open_mrs")
         return [
             m for m in self.mrs.values()
             if m["state"] == "opened" and m["author"]["id"] == author_id
         ]
 
     def mr(self, project, iid):
+        self.calls.append(f"mr:{self._iid(iid)}")
         return self.mrs[self._iid(iid)]
 
     def approvers(self, project, iid):
+        self.calls.append(f"approvers:{self._iid(iid)}")
         if self._iid(iid) not in self.mrs:
             raise RuntimeError("404 Not Found")
         return set(self.approvals.get(self._iid(iid), set()))
 
     def approval_info(self, project, iid):
-        return self.approvers(project, iid), self._iid(iid) not in self.cannot_approve
+        self.calls.append(f"approval_info:{self._iid(iid)}")
+        if self._iid(iid) not in self.mrs:
+            raise RuntimeError("404 Not Found")
+        return set(self.approvals.get(self._iid(iid), set())), self._iid(iid) not in self.cannot_approve
 
     def approve(self, project, iid, sha):
         self.posts.append((self._iid(iid), sha))
@@ -77,7 +84,10 @@ class FakeGitLab:
 
 
 class FakeSlack:
-    def __init__(self, announcements=None, fail_search=False, reacted=()):
+    def __init__(self, announcements=None, fail_search=False, reacted=(), recent=None, fail_recent=False):
+        self.recent = recent or []
+        self.fail_recent = fail_recent
+        self.recent_calls = []
         self.announcements = announcements or {}
         self.fail_search = fail_search
         self.reactions = {key: {ME_SLACK} for key in reacted}
@@ -87,6 +97,12 @@ class FakeSlack:
 
     async def whoami(self):
         return ME_SLACK
+
+    async def search_recent(self, since, mr_url_re):
+        self.recent_calls.append(since)
+        if self.fail_recent:
+            raise RuntimeError("slack down")
+        return [dict(m) for m in self.recent]
 
     async def search_mr(self, iid, mr_url_re):
         self.searches.append(iid)

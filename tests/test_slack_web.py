@@ -212,3 +212,38 @@ def test_slack_id_is_deduced_from_the_token_when_the_config_has_none(server, cfg
     cfg["me"].pop("slack_id")
     asyncio.run(approve.run_pass(cfg, ["alice"], True, {"mrs": {}}, 30))
     assert cfg["me"]["slack_id"] == "U0FROMTOKEN"
+
+
+class TestRecentScan:
+    def msg(self, ts, text=None):
+        return {"channel": {"id": "C1", "name": "front"}, "ts": ts, "user": "U1", "text": text or f"<{mr_url(7)}|!7>"}
+
+    def page(self, matches, pages=1):
+        return ok({"messages": {"matches": matches, "paging": {"pages": pages}}})
+
+    def test_asks_for_the_keyword_since_the_day_before_and_keeps_only_recent_messages(self, server):
+        server.script["search.messages"] = [self.page([self.msg("2000.5"), self.msg("10.5")], pages=3)]
+        found = run(web(server).search_recent(1000, URL_RE))
+        call = server.calls[0]
+        assert call["query"]["query"][0].startswith("merge_requests after:1969-12-31")
+        assert call["query"]["sort"] == ["timestamp"]
+        assert [m["ts"] for m in found] == ["2000.5"] and len(server.calls) == 1
+
+    def test_follows_the_pages_while_everything_is_recent(self, server):
+        server.script["search.messages"] = [
+            self.page([self.msg("3000.1"), self.msg("2000.2")], pages=2),
+            self.page([self.msg("1500.3"), self.msg("5.4")], pages=2),
+        ]
+        found = run(web(server).search_recent(1000, URL_RE))
+        assert [m["ts"] for m in found] == ["3000.1", "2000.2", "1500.3"]
+        assert [c["query"]["page"] for c in server.calls] == [["1"], ["2"]]
+
+    def test_stops_at_the_last_page(self, server):
+        server.script["search.messages"] = [self.page([self.msg("3000.1")], pages=1)]
+        run(web(server).search_recent(1000, URL_RE))
+        assert len(server.calls) == 1
+
+    def test_bot_messages_are_ignored(self, server):
+        bot = {**self.msg("3000.1"), "bot_id": "B1"}
+        server.script["search.messages"] = [self.page([bot, self.msg("3000.2")])]
+        assert [m["ts"] for m in run(web(server).search_recent(1000, URL_RE))] == ["3000.2"]
