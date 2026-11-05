@@ -1531,6 +1531,55 @@ async def why_pass(cfg, names):
     return 0
 
 
+def repo_root():
+    return Path(__file__).resolve().parent
+
+
+def git(root, *args):
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+
+
+def version_text():
+    root = repo_root()
+    if not (root / ".git").exists() or not shutil.which("git"):
+        return "mr-approver (version inconnue : pas un clone Git)"
+    sha = git(root, "rev-parse", "--short", "HEAD").stdout.strip()
+    day = git(root, "log", "-1", "--format=%cs").stdout.strip()
+    return f"mr-approver {sha} ({day})"
+
+
+def cmd_update():
+    root = repo_root()
+    if not (root / ".git").exists() or not shutil.which("git"):
+        print("Cette installation n'est pas un clone Git : mets-la à jour comme tu l'as installée.")
+        return 1
+    branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if branch != "main":
+        print(f"Tu es sur la branche « {branch} », pas sur main. Reviens dessus avec : git -C {root} checkout main")
+        return 1
+    if git(root, "status", "--porcelain").stdout.strip():
+        print(f"Tu as des modifications locales dans {root} : je ne touche à rien. Commite-les ou annule-les d'abord.")
+        return 1
+    fetched = git(root, "fetch", "origin", "main")
+    if fetched.returncode != 0:
+        print("Impossible de joindre GitHub :", (fetched.stderr or fetched.stdout).strip()[:200])
+        return 1
+    behind = git(root, "rev-list", "--count", "HEAD..origin/main").stdout.strip() or "0"
+    if int(behind) == 0:
+        print(f"Déjà à jour : {version_text()}")
+        return 0
+    news = git(root, "log", "--format=  %h %s", "HEAD..origin/main").stdout.rstrip()
+    print(f"{behind} nouveauté(s) :\n{news}")
+    merged = git(root, "merge", "--ff-only", "origin/main")
+    if merged.returncode != 0:
+        print("Mise à jour impossible sans conflit (ta copie a des commits que GitHub n'a pas) :", merged.stderr.strip()[:200])
+        return 1
+    print(f"\nMise à jour faite : {version_text()}")
+    if lock_held():
+        print("Une instance tourne encore avec l'ancien code : approve --stop, puis approve.")
+    return 0
+
+
 def build_parser(interval_default=None):
     parser = argparse.ArgumentParser(
         prog="approve",
@@ -1540,6 +1589,8 @@ def build_parser(interval_default=None):
     parser.add_argument("people", nargs="*", metavar="username",
                         help="username GitLab (ou raccourci de la config) ; 'username:all' = toutes ses MR, même sans annonce Slack ; "
                              "'add|remove|list' gère la liste mémorisée (sans nom, approve utilise cette liste)")
+    parser.add_argument("--update", action="store_true", help="met l'outil à jour (git pull sécurisé) et montre les nouveautés")
+    parser.add_argument("--version", action="store_true", help="affiche la version installée")
     parser.add_argument("--why", action="store_true", help="explique pourquoi chaque MR est (ou n'est pas) approuvée, sans rien écrire")
     parser.add_argument("--stop", action="store_true", help="arrête proprement l'instance qui tourne, d'où qu'elle ait été lancée")
     parser.add_argument("--init", action="store_true", help="crée la configuration en la détectant")
@@ -1563,6 +1614,11 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.version:
+        print(version_text())
+        return 0
+    if args.update:
+        return cmd_update()
     if args.init:
         return cmd_init(args)
     if args.doctor:
