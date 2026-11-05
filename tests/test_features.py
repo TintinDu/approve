@@ -299,3 +299,25 @@ class TestStop:
     def test_other_commands_of_the_tool_are_never_taken_for_the_instance(self, home, monkeypatch):
         self.ps(monkeypatch, "100 python /x/approve.py --stop\n101 python /x/approve.py --status\n")
         assert approve.running_pid() is None
+
+
+class TestPsIsNotTruncated:
+    def capture(self, monkeypatch):
+        seen = []
+
+        def fake(args, **kw):
+            seen.append(list(args))
+            return SimpleNamespace(stdout="100 python /very/long/path/approve.py\n")
+
+        monkeypatch.setattr(approve.subprocess, "run", fake)
+        return seen
+
+    def test_the_command_of_a_pid_is_read_with_unlimited_width(self, monkeypatch):
+        seen = self.capture(monkeypatch)
+        assert approve.pid_is_approve(100)
+        assert "-ww" in seen[0]
+
+    def test_the_process_listing_is_read_with_unlimited_width(self, monkeypatch, home):
+        seen = self.capture(monkeypatch)
+        approve.running_pid()
+        assert any("-wwaxo" in call for call in seen)

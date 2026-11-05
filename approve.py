@@ -906,7 +906,7 @@ def read_lock_pid():
 
 
 def pid_is_approve(pid):
-    out = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
+    out = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
     return "approve.py" in out
 
 
@@ -914,7 +914,7 @@ def running_pid():
     pid = read_lock_pid()
     if pid and pid_is_approve(pid):
         return pid
-    listing = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    listing = subprocess.run(["ps", "-wwaxo", "pid=,command="], capture_output=True, text=True).stdout
     skip = ("--stop", "--status", "--why", "--doctor", "--init", "--pause", "--resume")
     others = [int(line.split(None, 1)[0]) for line in listing.splitlines()
               if "approve.py" in line and not any(flag in line for flag in skip)]
