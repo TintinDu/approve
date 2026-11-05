@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +40,7 @@ STATE_DIR = APP_DIR / "state"
 STATE_PATH = STATE_DIR / "state.json"
 LOCK_PATH = STATE_DIR / "approve.lock"
 PAUSE_PATH = STATE_DIR / "PAUSE"
+WATCH_PATH = APP_DIR / "watch.json"
 JOURNAL_PATH = APP_DIR / "journal.jsonl"
 TOKEN_PATH = APP_DIR / "slack_token"
 TOKEN_ENV = "MR_APPROVER_SLACK_TOKEN"
@@ -48,10 +50,18 @@ PAUSE_POLL_SECONDS = 5
 STATUS_WINDOW_HOURS = 24
 EXIT_CAP_REACHED = 3
 EXIT_INTERRUPTED = 130
+STOP_WAIT_SECONDS = 40
+SUBCOMMANDS = ("add", "remove", "list")
 INTERRUPTED = threading.Event()
 DO_NOT_MERGE = re.compile(r"do[\s_-]*not[\s_-]*merge", re.IGNORECASE)
 SLACK_RETRIES = 3
-SLACK_PAUSE = 0.4
+SLACK_PAUSE = 0.1
+GITLAB_CONCURRENCY = 6
+SCAN_MARGIN_SECONDS = 120
+SCAN_MAX_PAGES = 5
+RECHECK_SECONDS = 900
+BLOCKED_OUTCOMES = ("not_allowed", "skipped", "do_not_merge")
+RECENT_KEYWORD = "merge_requests"
 MIN_PYTHON = (3, 11)
 SLACK_API = "https://slack.com/api/"
 SLACK_TIMEOUT = 30
@@ -73,6 +83,7 @@ DEFAULT_CONFIG = {
     "interval_seconds": 300,
     "rediscovery_minutes": 60,
     "merged_grace_hours": 48,
+    "reverify_minutes": 30,
     "max_approvals_per_pass": DEFAULT_MAX_APPROVALS,
     "slack_backend": "auto",
     "slack_mcp": {
@@ -112,11 +123,13 @@ class Budget:
     def __init__(self, cap):
         self.cap = cap
         self.used = 0
+        self.lock = threading.Lock()
 
     def take(self):
-        if self.used >= self.cap:
-            raise ApprovalCapReached(self.cap)
-        self.used += 1
+        with self.lock:
+            if self.used >= self.cap:
+                raise ApprovalCapReached(self.cap)
+            self.used += 1
 
 
 class GitLab:
@@ -172,21 +185,38 @@ class GitLab:
 class HermesSlack:
     def __init__(self, session):
         self.session = session
+        self.lock = asyncio.Lock()
 
     async def call(self, tool, args):
-        last = None
-        for attempt in range(SLACK_RETRIES):
-            try:
-                result = await self.session.call_tool(tool, args)
-                text = result.content[0].text if result.content else ""
-                if result.is_error:
-                    raise RuntimeError(text[:300])
-                await asyncio.sleep(SLACK_PAUSE)
-                return json.loads(text)
-            except Exception as exc:
-                last = exc
-                await asyncio.sleep(2 ** attempt)
-        raise RuntimeError(f"{tool}: {last}")
+        async with self.lock:
+            last = None
+            for attempt in range(SLACK_RETRIES):
+                try:
+                    result = await self.session.call_tool(tool, args)
+                    text = result.content[0].text if result.content else ""
+                    if result.is_error:
+                        raise RuntimeError(text[:300])
+                    await asyncio.sleep(SLACK_PAUSE)
+                    return json.loads(text)
+                except Exception as exc:
+                    last = exc
+                    await asyncio.sleep(2 ** attempt)
+            raise RuntimeError(f"{tool}: {last}")
+
+    async def search_recent(self, since, mr_url_re):
+        found, cursor = [], None
+        for _ in range(SCAN_MAX_PAGES):
+            args = {"keywords": [RECENT_KEYWORD], "after": str(int(since)), "sort": "timestamp",
+                    "sort_dir": "desc", "include_context": False, "limit": 20}
+            if cursor:
+                args["cursor"] = cursor
+            data = await self.call("slack_search_public_and_private", args)
+            found += parse_search(data.get("results", ""), mr_url_re)
+            match = re.search(r"cursor `([^`]+)`", data.get("pagination_info", ""))
+            if not match:
+                break
+            cursor = match.group(1)
+        return found
 
     async def whoami(self):
         data = await self.call("slack_read_user_profile", {"response_format": "detailed"})
@@ -221,6 +251,9 @@ class NoSlack:
     async def whoami(self):
         return None
 
+    async def search_recent(self, since, mr_url_re):
+        return []
+
     async def search_mr(self, iid, mr_url_re):
         return []
 
@@ -244,6 +277,7 @@ class SlackWeb:
         self.token = token
         self.base_url = base_url
         self.scopes = None
+        self.lock = asyncio.Lock()
 
     def request(self, method, params=None, post=False):
         body = urllib.parse.urlencode(params or {})
@@ -281,9 +315,25 @@ class SlackWeb:
         raise RuntimeError("Slack : plus de tentatives")
 
     async def call(self, method, params=None, post=False):
-        data = await asyncio.to_thread(self.request, method, params, post)
-        await asyncio.sleep(SLACK_PAUSE)
-        return data
+        async with self.lock:
+            data = await asyncio.to_thread(self.request, method, params, post)
+            await asyncio.sleep(SLACK_PAUSE)
+            return data
+
+    async def search_recent(self, since, mr_url_re):
+        day = time.strftime("%Y-%m-%d", time.gmtime(since - 86400))
+        found = []
+        for page in range(1, SCAN_MAX_PAGES + 1):
+            data = await self.call("search.messages", {
+                "query": f"{RECENT_KEYWORD} after:{day}", "count": 100, "sort": "timestamp",
+                "sort_dir": "desc", "page": page})
+            block = data.get("messages", {})
+            matches = block.get("matches", [])
+            fresh = [m for m in matches if float(m.get("ts", 0)) >= since]
+            found += parse_web_matches(fresh, mr_url_re)
+            if len(fresh) < len(matches) or page >= block.get("paging", {}).get("pages", 1):
+                break
+        return found
 
     async def whoami(self):
         return (await self.call("auth.test", post=True))["user_id"]
@@ -362,7 +412,12 @@ def save_state(state):
     tmp.replace(STATE_PATH)
 
 
-async def discover(slack, mr, entry, mr_url_re, now):
+def search_due(key, now, cfg):
+    spread = 1 + (zlib.crc32(key.encode()) % 50) / 100
+    return now + cfg.get("rediscovery_minutes", 60) * 60 * spread
+
+
+async def discover(slack, mr, entry, mr_url_re, now, due=None):
     found = await slack.search_mr(mr["iid"], mr_url_re)
     known = {(m["channel_id"], m["ts"]): m for m in entry.get("messages", [])}
     for m in found:
@@ -370,13 +425,29 @@ async def discover(slack, mr, entry, mr_url_re, now):
             known[(m["channel_id"], m["ts"])] = m
     entry["messages"] = list(known.values())
     entry["last_search"] = now
+    if due is not None:
+        entry["search_due"] = due
 
 
-def needs_discovery(entry, person, cfg, now):
-    stale = now - entry.get("last_search", 0) > cfg["rediscovery_minutes"] * 60
-    if not entry.get("messages"):
+def apply_recent(entry, mr_url, recent):
+    known = {(m["channel_id"], m["ts"]): m for m in entry.get("messages", [])}
+    changed = False
+    for m in recent:
+        if mr_url in m["urls"] and (m["channel_id"], m["ts"]) not in known:
+            known[(m["channel_id"], m["ts"])] = m
+            changed = True
+    if changed:
+        entry["messages"] = list(known.values())
+    return changed
+
+
+def needs_discovery(entry, person, cfg, now, scan_ok=False):
+    if "last_search" not in entry:
         return True
-    return stale or "last_search" not in entry
+    due = entry.get("search_due", entry["last_search"] + cfg["rediscovery_minutes"] * 60)
+    if now >= due:
+        return True
+    return not scan_ok and not entry.get("messages")
 
 
 def settled(entry, cfg, now):
@@ -400,14 +471,14 @@ def mr_key(mr):
 
 
 def approve_mr(gl, mr, me_id, dry, budget=None):
+    approvers, can_approve = gl.approval_info(mr["project_id"], mr["iid"])
+    if me_id in approvers:
+        return "already", mr["sha"]
     fresh = gl.mr(mr["project_id"], mr["iid"])
     if fresh["state"] != "opened" or fresh.get("draft"):
         return "skipped", fresh["sha"]
     if DO_NOT_MERGE.search(fresh.get("title", "")):
         return "do_not_merge", fresh["sha"]
-    approvers, can_approve = gl.approval_info(mr["project_id"], mr["iid"])
-    if me_id in approvers:
-        return "already", fresh["sha"]
     if not can_approve:
         return "not_allowed", fresh["sha"]
     if budget is not None:
@@ -437,113 +508,187 @@ def bundle_fully_approved(gl, urls, me_id, mr_url_re, cache):
 async def reconcile_reactions(slack, gl, entry, cfg, me, mr_url_re, dry, now, cache, stats):
     emoji = cfg["emoji"]
     reactions = entry.setdefault("reactions", {})
-    for msg in entry.get("messages", []):
+    ttl = cfg["rediscovery_minutes"] * 60
+    for msg in list(entry.get("messages", [])):
         key = f"{msg['channel_id']}:{msg['ts']}"
         if msg["channel"] in cfg["exclude_channels"] or msg["channel_id"] in cfg["exclude_channels"]:
             continue
         done = reactions.get(key)
-        if done and now - done["at"] < cfg["rediscovery_minutes"] * 60:
+        if done and now - done["at"] < ttl:
             continue
-        if ("msg", key) in cache:
-            reactions[key] = cache[("msg", key)]
-            continue
-        if not bundle_fully_approved(gl, msg["urls"], me["gitlab_id"], mr_url_re, cache):
-            continue
-        present = me["slack_id"] in await slack.reactors(msg["channel_id"], msg["ts"], emoji)
-        if not present:
-            if dry:
-                stats["would_react"] += 1
-                log(f"  DRY réaction :{emoji}: sur {msg['channel']} {msg['ts']}")
+        lock = cache.setdefault(("lock", key), asyncio.Lock())
+        async with lock:
+            if ("msg", key) in cache:
+                reactions[key] = cache[("msg", key)]
                 continue
-            await slack.react(msg["channel_id"], msg["ts"], emoji)
-            if me["slack_id"] not in await slack.reactors(msg["channel_id"], msg["ts"], emoji):
-                raise RuntimeError(f"reaction not visible on {key}")
-            stats["reacted"] += 1
-            journal("reaction_added", channel=msg["channel"], ts=msg["ts"], urls=msg["urls"])
-            log(f"  réaction :{emoji}: ajoutée sur {msg['channel']} {msg['ts']}")
-        reactions[key] = cache[("msg", key)] = {"at": now}
+            approved = await asyncio.to_thread(
+                bundle_fully_approved, gl, msg["urls"], me["gitlab_id"], mr_url_re, cache
+            )
+            if not approved:
+                continue
+            present = me["slack_id"] in await slack.reactors(msg["channel_id"], msg["ts"], emoji)
+            if not present:
+                if dry:
+                    stats["would_react"] += 1
+                    log(f"  DRY réaction :{emoji}: sur {msg['channel']} {msg['ts']}")
+                    continue
+                await slack.react(msg["channel_id"], msg["ts"], emoji)
+                if me["slack_id"] not in await slack.reactors(msg["channel_id"], msg["ts"], emoji):
+                    raise RuntimeError(f"reaction not visible on {key}")
+                stats["reacted"] += 1
+                journal("reaction_added", channel=msg["channel"], ts=msg["ts"], urls=msg["urls"])
+                log(f"  réaction :{emoji}: ajoutée sur {msg['channel']} {msg['ts']}")
+            reactions[key] = cache[("msg", key)] = {"at": now}
 
 
-async def process_person(name, person, cfg, gl, slack, state, dry, budget=None):
+def make_mr_url_re(host):
+    return re.compile(r"(https://" + re.escape(host) + r"/[\w.\-/]+?/-/merge_requests/\d+)")
+
+
+def leaves(group):
+    for exc in group.exceptions:
+        if isinstance(exc, BaseExceptionGroup):
+            yield from leaves(exc)
+        else:
+            yield exc
+
+
+def unwrap_group(group):
+    found = list(leaves(group))
+    for kind in (KeyboardInterrupt, ApprovalCapReached):
+        for exc in found:
+            if isinstance(exc, kind):
+                return exc
+    return found[0]
+
+
+async def run_all(coros):
+    try:
+        async with asyncio.TaskGroup() as group:
+            for coro in coros:
+                group.create_task(coro)
+    except BaseExceptionGroup as caught:
+        raise unwrap_group(caught) from None
+
+
+STAT_KEYS = ["open", "approved", "already", "would_approve", "skipped", "gated", "reacted",
+             "would_react", "errors", "not_allowed", "do_not_merge"]
+
+
+async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, recent=None):
     me = cfg["me"]
-    mr_url_re = re.compile(
-        r"(https://" + re.escape(cfg["gitlab_host"]) + r"/[\w.\-/]+?/-/merge_requests/\d+)"
-    )
-    stats = dict.fromkeys(["open", "approved", "already", "would_approve", "skipped", "gated",
-                           "reacted", "would_react", "errors", "not_allowed", "do_not_merge"], 0)
+    mr_url_re = make_mr_url_re(cfg["gitlab_host"])
+    stats = dict.fromkeys(STAT_KEYS, 0)
     now = time.time()
-    mrs = [m for m in gl.open_mrs(person["gitlab_id"]) if not m.get("draft")]
+    scan_ok = recent is not None
+    recent = recent or []
+    reverify = cfg.get("reverify_minutes", 30) * 60
+    mrs = [m for m in await asyncio.to_thread(gl.open_mrs, person["gitlab_id"]) if not m.get("draft")]
     stats["open"] = len(mrs)
-    bundle_cache = {}
-    for mr in mrs:
-        key = mr_key(mr)
-        if DO_NOT_MERGE.search(mr.get("title", "")):
-            stats["do_not_merge"] += 1
-            continue
-        entry = state["mrs"].setdefault(key, {})
-        entry["author_id"] = person["gitlab_id"]
-        entry["last_seen"] = now
-        try:
-            if needs_discovery(entry, person, cfg, now):
-                await discover(slack, mr, entry, mr_url_re, now)
-        except RuntimeError as exc:
-            stats["errors"] += 1
-            log(f"  recherche Slack en échec pour {key}: {exc}")
-            if person["require_announcement"]:
-                continue
-        if person["require_announcement"] and not entry.get("messages"):
-            stats["gated"] += 1
-            continue
-        try:
-            outcome, sha = approve_mr(gl, mr, me["gitlab_id"], dry, budget)
-            stats[outcome] += 1
-            entry["sha"] = sha
-            if outcome == "approved":
-                bundle_cache[mr["web_url"]] = True
-            if outcome in ("approved", "would_approve"):
-                journal("approval", mr=key, sha=sha, url=mr["web_url"], dry=dry)
-                log(f"  {'DRY approuverait' if dry else 'approuvée'} {key} {mr['title'][:60]}")
-            if outcome in ("approved", "already", "would_approve"):
-                await reconcile_reactions(
-                    slack, gl, entry, cfg, me, mr_url_re, dry or outcome == "would_approve",
-                    now, bundle_cache, stats,
-                )
-        except RuntimeError as exc:
-            stats["errors"] += 1
-            journal("error", mr=key, error=str(exc))
-            log(f"  erreur sur {key}: {exc}")
-    await process_merged(person, cfg, gl, slack, state, dry, mr_url_re, bundle_cache, stats, now,
-                         {mr_key(m) for m in mrs})
+    cache = {}
+    gate = asyncio.Semaphore(GITLAB_CONCURRENCY)
+
+    async def handle(mr):
+        async with gate:
+            key = mr_key(mr)
+            if DO_NOT_MERGE.search(mr.get("title", "")):
+                stats["do_not_merge"] += 1
+                return
+            entry = state["mrs"].setdefault(key, {})
+            entry.update(author_id=person["gitlab_id"], last_seen=now, web_url=mr["web_url"])
+            apply_recent(entry, mr["web_url"], recent)
+            try:
+                if needs_discovery(entry, person, cfg, now, scan_ok):
+                    await discover(slack, mr, entry, mr_url_re, now, search_due(key, now, cfg))
+            except RuntimeError as exc:
+                stats["errors"] += 1
+                log(f"  recherche Slack en échec pour {key}: {exc}")
+                if person["require_announcement"]:
+                    return
+            if person["require_announcement"] and not entry.get("messages"):
+                stats["gated"] += 1
+                return
+            try:
+                blocked = entry.get("blocked", {})
+                unchanged = entry.get("approved_sha") == mr.get("sha") and now - entry.get("verified_at", 0) < reverify
+                still_blocked = blocked.get("sha") == mr.get("sha") and now - blocked.get("at", 0) < reverify
+                if unchanged:
+                    outcome, sha = "already", mr["sha"]
+                elif still_blocked:
+                    outcome, sha = blocked["outcome"], mr["sha"]
+                else:
+                    outcome, sha = await asyncio.to_thread(approve_mr, gl, mr, me["gitlab_id"], dry, budget)
+                    entry.pop("blocked", None)
+                    if outcome in BLOCKED_OUTCOMES:
+                        entry["blocked"] = {"sha": sha, "outcome": outcome, "at": now}
+                stats[outcome] += 1
+                entry["sha"] = sha
+                if outcome in ("approved", "already"):
+                    entry.update(approved_sha=sha, verified_at=now if not unchanged else entry["verified_at"])
+                    cache[mr["web_url"]] = True
+                if outcome in ("approved", "would_approve"):
+                    journal("approval", mr=key, sha=sha, url=mr["web_url"], dry=dry)
+                    log(f"  {'DRY approuverait' if dry else 'approuvée'} {key} {mr['title'][:60]}")
+                if outcome in ("approved", "already", "would_approve"):
+                    await reconcile_reactions(
+                        slack, gl, entry, cfg, me, mr_url_re, dry or outcome == "would_approve",
+                        now, cache, stats,
+                    )
+            except RuntimeError as exc:
+                stats["errors"] += 1
+                journal("error", mr=key, error=str(exc))
+                log(f"  erreur sur {key}: {exc}")
+
+    await run_all(handle(mr) for mr in mrs)
+    await process_merged(person, cfg, gl, slack, state, dry, mr_url_re, cache, stats, now,
+                         {mr_key(m) for m in mrs}, recent, scan_ok)
     return stats
 
 
-async def process_merged(person, cfg, gl, slack, state, dry, mr_url_re, cache, stats, now, open_keys):
+async def process_merged(person, cfg, gl, slack, state, dry, mr_url_re, cache, stats, now, open_keys,
+                         recent=None, scan_ok=False):
     me = cfg["me"]
     grace = cfg.get("merged_grace_hours", 48) * 3600
+    candidates = []
     for key, entry in state["mrs"].items():
         if key in open_keys or "sha" not in entry:
             continue
         entry.setdefault("last_seen", now)
         if now - entry["last_seen"] > grace or entry.get("author_id", person["gitlab_id"]) != person["gitlab_id"]:
             continue
-        if settled(entry, cfg, now):
+        if entry.get("web_url") and recent:
+            apply_recent(entry, entry["web_url"], recent)
+        if settled(entry, cfg, now) or entry.get("recheck_at", 0) > now:
             continue
-        project, iid = key.split("!")
-        try:
-            fresh = gl.mr(project, iid)
-            if fresh["author"]["id"] != person["gitlab_id"]:
-                entry["author_id"] = fresh["author"]["id"]
-                continue
-            entry["author_id"] = person["gitlab_id"]
-            if fresh["state"] != "merged" or me["gitlab_id"] not in gl.approvers(project, iid):
-                continue
-            if needs_discovery(entry, person, cfg, now):
-                await discover(slack, fresh, entry, mr_url_re, now)
-            await reconcile_reactions(slack, gl, entry, cfg, me, mr_url_re, dry, now, cache, stats)
-        except RuntimeError as exc:
-            stats["errors"] += 1
-            journal("error", mr=key, error=str(exc))
-            log(f"  erreur sur MR mergée {key}: {exc}")
+        if not entry.get("messages") and not needs_discovery(entry, person, cfg, now, scan_ok):
+            continue
+        candidates.append((key, entry))
+    gate = asyncio.Semaphore(GITLAB_CONCURRENCY)
+
+    async def handle(key, entry):
+        async with gate:
+            project, iid = key.split("!")
+            try:
+                fresh = await asyncio.to_thread(gl.mr, project, iid)
+                if fresh["author"]["id"] != person["gitlab_id"]:
+                    entry["author_id"] = fresh["author"]["id"]
+                    return
+                entry["author_id"] = person["gitlab_id"]
+                entry["web_url"] = fresh["web_url"]
+                approvers = await asyncio.to_thread(gl.approvers, project, iid)
+                if fresh["state"] != "merged" or me["gitlab_id"] not in approvers:
+                    return
+                if needs_discovery(entry, person, cfg, now, scan_ok):
+                    await discover(slack, fresh, entry, mr_url_re, now, search_due(key, now, cfg))
+                await reconcile_reactions(slack, gl, entry, cfg, me, mr_url_re, dry, now, cache, stats)
+                if not settled(entry, cfg, now):
+                    entry["recheck_at"] = now + RECHECK_SECONDS
+            except RuntimeError as exc:
+                stats["errors"] += 1
+                journal("error", mr=key, error=str(exc))
+                log(f"  erreur sur MR mergée {key}: {exc}")
+
+    await run_all(handle(key, entry) for key, entry in candidates)
 
 
 def load_env():
@@ -644,12 +789,28 @@ async def run_pass(cfg, names, dry, state, max_approvals):
     gl = GitLab(cfg["gitlab_host"])
     errors = 0
     budget = Budget(max_approvals)
+    mr_url_re = make_mr_url_re(cfg["gitlab_host"])
     async with slack_session(cfg) as slack:
         if not cfg["me"].get("slack_id"):
             cfg["me"]["slack_id"] = await slack.whoami()
+        started = time.time()
+        since = state.get("recent_scan")
+        recent = None
+        if since:
+            try:
+                recent = await slack.search_recent(since - SCAN_MARGIN_SECONDS, mr_url_re)
+            except Exception as exc:
+                log(f"  balayage Slack récent en échec ({describe(exc)}) : recherche MR par MR")
+        results = {}
+
+        async def one(name):
+            results[name] = await process_person(
+                name, cfg["people"][name], cfg, gl, slack, state, dry, budget, recent)
+
+        await run_all(one(name) for name in names)
         parts = []
         for name in names:
-            s = await process_person(name, cfg["people"][name], cfg, gl, slack, state, dry, budget)
+            s = results[name]
             errors += s["errors"]
             parts.append(
                 f"{name}: {s['open']} ouvertes, {s['approved'] + s['would_approve']} "
@@ -659,18 +820,25 @@ async def run_pass(cfg, names, dry, state, max_approvals):
                 + (f", {s['not_allowed']} non approuvables" if s["not_allowed"] else "")
                 + (f", {s['errors']} erreurs" if s["errors"] else "")
             )
+        if recent is not None or not since:
+            state["recent_scan"] = started
         log(" | ".join(parts) + (" [simulation]" if dry else ""))
     return errors
+
+
+def mode_text(person):
+    return "seulement les MR annoncées sur Slack" if person["require_announcement"] else "toutes ses MR ouvertes"
 
 
 def resolve_people(tokens, cfg):
     gl = GitLab(cfg["gitlab_host"])
     resolved = {}
+    known = cfg.get("people", {})
+    by_id = {p["gitlab_id"]: p for p in known.values() if "gitlab_id" in p}
     for token in tokens:
         name, _, flag = token.partition(":")
-        if flag not in ("", "all"):
-            sys.exit(f"{token}: suffixe inconnu (seul ':all' existe)")
-        known = cfg.get("people", {})
+        if flag not in ("", "all", "announced"):
+            sys.exit(f"{token}: suffixe inconnu (':all' ou ':announced')")
         if name in known and not flag:
             resolved[name] = known[name]
             continue
@@ -680,12 +848,13 @@ def resolve_people(tokens, cfg):
         if len(users) != 1:
             lines = "\n".join(f"  {u['username']} ({u['name']})" for u in users) or "  aucun"
             sys.exit(f"{name}: {len(users)} correspondances, précise le username :\n{lines}")
-        resolved[name] = {
-            "gitlab_id": users[0]["id"],
-            "require_announcement": known.get(name, {}).get("require_announcement", True)
-            and flag != "all",
-            "label": users[0]["name"],
-        }
+        inherited = by_id.get(users[0]["id"])
+        require = inherited["require_announcement"] if inherited else True
+        if flag == "all":
+            require = False
+        elif flag == "announced":
+            require = True
+        resolved[name] = {"gitlab_id": users[0]["id"], "require_announcement": require, "label": users[0]["name"]}
     return resolved
 
 
@@ -721,12 +890,60 @@ def describe(exc):
 
 def lock_held():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCK_PATH.open("w") as handle:
+    with LOCK_PATH.open("a+") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return True
         return False
+
+
+def read_lock_pid():
+    try:
+        return int(LOCK_PATH.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_is_approve(pid):
+    out = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
+    return "approve.py" in out
+
+
+def running_pid():
+    pid = read_lock_pid()
+    if pid and pid_is_approve(pid):
+        return pid
+    listing = subprocess.run(["ps", "-wwaxo", "pid=,command="], capture_output=True, text=True).stdout
+    skip = ("--stop", "--status", "--why", "--doctor", "--init", "--pause", "--resume")
+    others = [int(line.split(None, 1)[0]) for line in listing.splitlines()
+              if "approve.py" in line and not any(flag in line for flag in skip)]
+    others = [other for other in others if other != os.getpid()]
+    return others[0] if len(others) == 1 else None
+
+
+def cmd_stop(wait_seconds=STOP_WAIT_SECONDS):
+    if not lock_held():
+        print("Aucune instance en cours.")
+        return 0
+    pid = running_pid()
+    if pid is None:
+        print("Une instance tourne mais son numéro de processus est introuvable.")
+        print("Arrête-la avec Ctrl-C dans le terminal où elle a été lancée.")
+        return 1
+    print(f"Arrêt de l'instance {pid}…")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if not lock_held():
+            print("Instance arrêtée.")
+            return 0
+        time.sleep(0.2)
+    print(f"L'instance {pid} ne s'est pas arrêtée en {wait_seconds} s. Réessaie, ou : kill -9 {pid}")
+    return 1
 
 
 def set_pause(on):
@@ -760,7 +977,7 @@ def status_report(now=None):
     passes = [r for r in read_journal() if r["event"] in ("pass", "pass_failed")]
     last = passes[-1] if passes else None
     lines = [
-        f"approve : {'en cours' if lock_held() else 'arrêté'}",
+        f"approve : {'en cours' + (f' (PID {read_lock_pid()})' if read_lock_pid() else '') if lock_held() else 'arrêté'}",
         f"pause : {'oui' if PAUSE_PATH.exists() else 'non'}",
         f"dernière passe : {last['at'] if last else 'aucune'}"
         + ("" if not last else " (échec)" if last["event"] == "pass_failed"
@@ -775,11 +992,16 @@ def status_report(now=None):
 
 def acquire_lock():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    handle = LOCK_PATH.open("w")
+    handle = LOCK_PATH.open("a+")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit("approve tourne déjà (verrou pris), une seule instance à la fois.")
+        handle.close()
+        sys.exit("approve tourne déjà (verrou pris), une seule instance à la fois.\nPour l'arrêter : approve --stop")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
     return handle
 
 
@@ -1139,6 +1361,176 @@ def cmd_doctor(host=None):
     return 0
 
 
+def load_watch():
+    try:
+        data = json.loads(WATCH_PATH.read_text())
+    except (OSError, ValueError):
+        return []
+    return [t for t in data.get("people", []) if isinstance(t, str) and t]
+
+
+def save_watch(tokens):
+    WATCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WATCH_PATH.write_text(json.dumps({"people": tokens}, indent=2, ensure_ascii=False) + "\n")
+
+
+def token_name(token):
+    return token.partition(":")[0]
+
+
+def merge_watch(current, additions):
+    names = {token_name(t): i for i, t in enumerate(current)}
+    merged = list(current)
+    for token in additions:
+        if token_name(token) in names:
+            merged[names[token_name(token)]] = token
+        else:
+            names[token_name(token)] = len(merged)
+            merged.append(token)
+    return merged
+
+
+def shortcut_people():
+    try:
+        return json.loads(CONFIG_PATH.read_text()).get("people", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def offline_mode(token, shortcuts):
+    name, _, flag = token.partition(":")
+    if flag == "all":
+        return "toutes ses MR ouvertes"
+    if flag == "announced":
+        return "seulement les MR annoncées sur Slack"
+    person = shortcuts.get(name)
+    return mode_text(person) if person else "seulement les MR annoncées sur Slack"
+
+
+def print_watch(tokens):
+    if not tokens:
+        print("La liste est vide. Ajoute quelqu'un : approve add <username>")
+        return
+    shortcuts = shortcut_people()
+    print("Personnes suivies :")
+    for token in tokens:
+        print(f"  {token_name(token):<24} {offline_mode(token, shortcuts)}")
+
+
+def cmd_watch(sub, tokens, host=None):
+    current = load_watch()
+    if sub == "list":
+        print_watch(current)
+        return 0
+    if not tokens:
+        print(f"approve {sub} : indique au moins un username.")
+        return 1
+    if sub == "add":
+        cfg, _ = load_config(host)
+        resolve_people(tokens, cfg)
+        current = merge_watch(current, tokens)
+        save_watch(current)
+    else:
+        names = {token_name(t) for t in tokens}
+        missing = sorted(names - {token_name(t) for t in current})
+        current = [t for t in current if token_name(t) not in names]
+        save_watch(current)
+        for name in missing:
+            print(f"{name} n'était pas dans la liste.")
+    print_watch(current)
+    return 0
+
+
+WHY_ORDER = ("todo", "unannounced", "notallowed", "dnm", "draft", "done")
+WHY_LABELS = {
+    "todo": ("→", "à approuver"),
+    "unannounced": ("○", "non annoncée"),
+    "notallowed": ("✗", "non approuvable"),
+    "dnm": ("✗", "DO NOT MERGE"),
+    "draft": ("·", "brouillon"),
+    "done": ("✓", "déjà approuvée"),
+}
+
+
+async def explain_person(person, cfg, gl, slack, state, recent):
+    me = cfg["me"]
+    mr_url_re = make_mr_url_re(cfg["gitlab_host"])
+    now = time.time()
+    scan_ok = recent is not None
+    recent = recent or []
+    mrs = await asyncio.to_thread(gl.open_mrs, person["gitlab_id"])
+    rows = []
+    gate = asyncio.Semaphore(GITLAB_CONCURRENCY)
+
+    async def judge(mr):
+        async with gate:
+            key = mr_key(mr)
+
+            def row(kind, reason=""):
+                rows.append({"key": key, "title": mr.get("title", ""), "kind": kind, "reason": reason})
+
+            if mr.get("draft"):
+                return row("draft", "les brouillons ne sont jamais approuvés")
+            if DO_NOT_MERGE.search(mr.get("title", "")):
+                return row("dnm", "le titre contient « DO NOT MERGE »")
+            if person["require_announcement"]:
+                if isinstance(slack, NoSlack):
+                    return row("unannounced", "Slack n'est pas branché : écris nom:all pour tout approuver")
+                entry = state["mrs"].setdefault(key, {})
+                apply_recent(entry, mr["web_url"], recent)
+                try:
+                    if needs_discovery(entry, person, cfg, now, scan_ok):
+                        await discover(slack, mr, entry, mr_url_re, now, search_due(key, now, cfg))
+                except RuntimeError as exc:
+                    return row("unannounced", f"recherche Slack impossible ({exc})")
+                if not entry.get("messages"):
+                    return row("unannounced", "aucun lien trouvé dans Slack (mode « annoncées »)")
+            approvers, can_approve = await asyncio.to_thread(gl.approval_info, mr["project_id"], mr["iid"])
+            if me["gitlab_id"] in approvers:
+                return row("done")
+            if not can_approve:
+                return row("notallowed", "tu n'es pas approbateur autorisé de cette MR")
+            row("todo", "sera approuvée à la prochaine passe")
+
+    await run_all(judge(mr) for mr in mrs)
+    return sorted(rows, key=lambda r: (WHY_ORDER.index(r["kind"]), r["key"]))
+
+
+def print_why(name, person, rows):
+    print(f"\n{name} : {mode_text(person)}, {len(rows)} MR ouvertes")
+    for row in rows:
+        if row["kind"] == "done":
+            continue
+        icon, label = WHY_LABELS[row["kind"]]
+        reason = f"  ({row['reason']})" if row["reason"] else ""
+        print(f"  {icon} {label:<16} {row['key']:<10} {row['title'][:56]}{reason}")
+    done = sum(1 for row in rows if row["kind"] == "done")
+    if done:
+        print(f"  ✓ {done} déjà approuvée(s)")
+
+
+async def why_pass(cfg, names):
+    gl = GitLab(cfg["gitlab_host"])
+    state = copy.deepcopy(load_state())
+    mr_url_re = make_mr_url_re(cfg["gitlab_host"])
+    async with slack_session(cfg) as slack:
+        recent = None
+        if state.get("recent_scan"):
+            try:
+                recent = await slack.search_recent(state["recent_scan"] - SCAN_MARGIN_SECONDS, mr_url_re)
+            except Exception:
+                recent = None
+        results = {}
+
+        async def one(name):
+            results[name] = await explain_person(cfg["people"][name], cfg, gl, slack, state, recent)
+
+        await run_all(one(name) for name in names)
+    for name in names:
+        print_why(name, cfg["people"][name], results[name])
+    return 0
+
+
 def build_parser(interval_default=None):
     parser = argparse.ArgumentParser(
         prog="approve",
@@ -1146,7 +1538,10 @@ def build_parser(interval_default=None):
         epilog="Premiers pas : approve --init, puis approve --doctor, puis approve <username> --dry-run --once",
     )
     parser.add_argument("people", nargs="*", metavar="username",
-                        help="username GitLab (ou raccourci de la config) ; 'username:all' = toutes ses MR, même sans annonce Slack")
+                        help="username GitLab (ou raccourci de la config) ; 'username:all' = toutes ses MR, même sans annonce Slack ; "
+                             "'add|remove|list' gère la liste mémorisée (sans nom, approve utilise cette liste)")
+    parser.add_argument("--why", action="store_true", help="explique pourquoi chaque MR est (ou n'est pas) approuvée, sans rien écrire")
+    parser.add_argument("--stop", action="store_true", help="arrête proprement l'instance qui tourne, d'où qu'elle ait été lancée")
     parser.add_argument("--init", action="store_true", help="crée la configuration en la détectant")
     parser.add_argument("--doctor", action="store_true", help="vérifie l'installation et dit quoi corriger")
     parser.add_argument("--status", action="store_true", help="état de l'outil et bilan des 24 dernières heures")
@@ -1179,8 +1574,13 @@ def main(argv=None):
     if args.status:
         print(status_report())
         return 0
-    if not args.people:
-        parser.error("indique au moins un username (ou --init, --doctor, --status, --pause, --resume)")
+    if args.stop:
+        return cmd_stop()
+    if args.people and args.people[0] in SUBCOMMANDS:
+        return cmd_watch(args.people[0], args.people[1:], args.host)
+    tokens = args.people or load_watch()
+    if not tokens:
+        parser.error("indique au moins un username, ou mémorise une liste : approve add <username>")
 
     install_stop_handlers()
     cfg, auto = load_config(args.host)
@@ -1189,8 +1589,10 @@ def main(argv=None):
     backend = resolve_backend(cfg)
     if backend == "hermes":
         ensure_hermes_python()
-    cfg["people"] = resolve_people(args.people, cfg)
+    cfg["people"] = resolve_people(tokens, cfg)
     args.people = list(cfg["people"])
+    if args.why:
+        return asyncio.run(why_pass(cfg, args.people))
     if backend is None:
         refusal = gitlab_only_refusal(cfg["people"])
         if refusal:
@@ -1203,6 +1605,8 @@ def main(argv=None):
         log(f"Aucune config : serveur {cfg['gitlab_host']} et compte détectés depuis glab")
     if backend is None:
         log(GITLAB_ONLY_NOTE)
+    for name, person in cfg["people"].items():
+        log(f"  {name} : {mode_text(person)}")
     log(f"approve {' '.join(args.people)} — {mode} — toutes les {interval}s, "
         f"plafond {max_approvals} approbations/passe — Ctrl-C pour arrêter")
     try:

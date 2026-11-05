@@ -80,6 +80,10 @@ Ensuite : `approve --doctor` vérifie tout.
 | `approve alice` | boucle : n'approuve que les MR d'`alice` dont le **lien a été annoncé sur Slack** (demande Slack) |
 | `approve alice bob:all` | plusieurs personnes à la fois |
 | `approve alice:all --dry-run --once` | simulation, une seule passe, n'écrit rien |
+| `approve --why alice bob` | **explique** pourquoi chaque MR ouverte est (ou n'est pas) approuvée ; lecture seule, utilisable pendant qu'une instance tourne |
+| `approve add dave` / `approve remove dave` / `approve list` | gère la **liste mémorisée** de personnes |
+| `approve` (sans nom) | lance la boucle sur la liste mémorisée |
+| `approve --stop` | arrête proprement l'instance qui tourne, **d'où qu'elle ait été lancée** |
 | `approve --status` | est-ce que ça tourne ? bilan des dernières 24 h |
 | `approve --pause` / `approve --resume` | suspend / reprend sans tuer le processus |
 | `approve --init` | branche Slack et écrit la configuration |
@@ -87,6 +91,33 @@ Ensuite : `approve --doctor` vérifie tout.
 | `approve --help` | liste de toutes les options |
 
 Sans accès Slack, `approve alice` (sans `:all`) est refusé avec la commande exacte à taper, plutôt que d'approuver à l'aveugle.
+
+### Pourquoi cette MR n'est pas approuvée ?
+
+```bash
+approve --why alice bob
+```
+
+Pour chaque MR ouverte, l'outil indique le verdict et la raison : **à approuver**, **non annoncée** (aucun lien dans Slack), **non approuvable** (tu n'es pas approbateur), **DO NOT MERGE**, **brouillon**. Les MR déjà approuvées sont simplement comptées.
+
+### La liste mémorisée
+
+```bash
+approve add dave carol:all     # mémorise ces personnes (le nom est vérifié tout de suite)
+approve list                   # montre la liste et le mode de chacun
+approve                        # lance la boucle sur la liste
+approve remove dave
+```
+
+Les noms écrits sur la ligne de commande l'emportent sur la liste.
+
+### Le mode de chaque personne
+
+- **Sans suffixe** : seulement les MR dont le lien est annoncé sur Slack (mode prudent).
+- **`:all`** : toutes ses MR ouvertes. À réserver aux personnes dont tu approuves tout.
+- **`:announced`** : force le mode prudent.
+
+Si le nom que tu tapes désigne la même personne qu'un raccourci de ta config (par exemple `alice.martin` pour le raccourci `alice`), elle **garde le mode du raccourci**. L'outil rappelle le mode de chacun à chaque lancement.
 
 ---
 
@@ -144,6 +175,7 @@ Tout est rangé dans un seul dossier, `~/.mr-approver/` :
 | `max_approvals_per_pass` | `30` | plafond d'approbations par passe |
 | `rediscovery_minutes` | `60` | fréquence de re-vérification des annonces déjà trouvées |
 | `merged_grace_hours` | `48` | durée pendant laquelle on suit une MR mergée pour sa réaction |
+| `reverify_minutes` | `30` | une MR dont le code n'a pas changé n'est pas revérifiée avant ce délai |
 | `people` | `{}` | raccourcis facultatifs (voir ci-dessous) |
 
 **Raccourcis (`people`)** : facultatif. Pour taper `approve al` au lieu de `approve alice.martin`, ajoute :
@@ -151,6 +183,19 @@ Tout est rangé dans un seul dossier, `~/.mr-approver/` :
 ```json
 "people": { "al": { "gitlab_id": 1001, "require_announcement": true } }
 ```
+
+---
+
+## Rapidité
+
+Une passe complète prend **quelques secondes** (4 à 5 s pour une soixantaine de MR). Pour y arriver :
+
+- **un seul balayage** des messages Slack récents par passe, au lieu d'une recherche par MR (chaque MR est quand même cherchée une fois à sa première apparition, puis environ toutes les heures par sécurité) ;
+- une MR dont le dernier commit n'a pas changé n'est pas revérifiée pendant `reverify_minutes` ;
+- les MR et les personnes sont traitées **en parallèle** ;
+- les MR mergées sans annonce ne sont plus surveillées pour rien.
+
+La toute première passe, ou après un effacement de `~/.mr-approver/state/`, est plus longue (une recherche par MR).
 
 ---
 
@@ -165,9 +210,10 @@ Commence toujours par **`approve --doctor`** : il teste chaque maillon et indiqu
 | « Ce jeton ne fonctionne pas » / `invalid_auth` | jeton faux, révoqué, ou copié avec un espace | recrée-le et relance `approve --init` |
 | « Il manque : reactions:write… » | l'application Slack n'a pas tous les droits | ajoute-les dans **OAuth & Permissions > User Token Scopes**, réinstalle l'app, recopie le jeton |
 | Erreur de certificat HTTPS (réseau d'entreprise) | un proxy d'inspection TLS | définis `SSL_CERT_FILE` vers le certificat racine de ton entreprise |
-| « approve tourne déjà (verrou pris) » | une autre instance tourne | `approve --status` ; arrête-la avec Ctrl-C dans son terminal |
+| « approve tourne déjà (verrou pris) » | une autre instance tourne | `approve --status` puis `approve --stop` |
 | Aucune réaction posée | pas d'annonce trouvée, message groupé avec une MR non approuvée, ou canal exclu | `--dry-run --once` pour voir ; vérifie `exclude_channels` |
-| Une MR n'est pas approuvée | brouillon, « DO NOT MERGE », tu n'es pas approbateur autorisé, ou pas d'annonce Slack | le résumé de passe les compte (« sans annonce », « DO NOT MERGE », « non approuvables ») |
+| Une MR n'est pas approuvée | brouillon, « DO NOT MERGE », tu n'es pas approbateur autorisé, ou pas d'annonce Slack | **`approve --why <nom>`** donne la raison exacte de chaque MR |
+| Ctrl-C ne semble rien faire | l'instance tourne dans un autre terminal | `approve --stop` |
 | « plafond d'approbations atteint » | plus de 30 approbations en une passe | vérifie le journal, puis relance avec `--max-approvals N` |
 | Passes en échec côté Slack | jeton révoqué, ou autorisation Hermes expirée | `approve --doctor` indique lequel |
 
