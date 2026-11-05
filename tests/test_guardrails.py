@@ -169,3 +169,43 @@ class TestStatus:
         finally:
             handle.close()
         assert "arrêté" in approve.status_report()
+
+
+class TestInterruptAtStartup:
+    def test_ctrl_c_before_the_loop_stops_cleanly_instead_of_a_traceback(self, monkeypatch, capsys):
+        def interrupted(argv=None):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(approve, "main", interrupted)
+        assert approve.cli() == approve.EXIT_INTERRUPTED
+        assert "arrêté" in capsys.readouterr().out
+
+    def test_normal_exit_codes_are_passed_through(self, monkeypatch):
+        monkeypatch.setattr(approve, "main", lambda argv=None: 3)
+        assert approve.cli() == 3
+
+
+class TestStopRequest:
+    @pytest.fixture(autouse=True)
+    def reset(self):
+        approve.INTERRUPTED.clear()
+        yield
+        approve.INTERRUPTED.clear()
+
+    def test_a_plain_error_is_not_a_stop_request(self):
+        assert not approve.stop_requested(RuntimeError("glab failed"))
+
+    def test_a_remembered_signal_wins_over_whatever_error_it_caused(self):
+        approve.INTERRUPTED.set()
+        assert approve.stop_requested(RuntimeError("glab was killed by the same Ctrl-C"))
+
+    def test_the_handler_remembers_the_request_and_interrupts(self):
+        with pytest.raises(KeyboardInterrupt):
+            approve.request_stop(2, None)
+        assert approve.INTERRUPTED.is_set()
+
+    def test_both_ctrl_c_and_kill_are_handled(self, monkeypatch):
+        installed = {}
+        monkeypatch.setattr(approve.signal, "signal", lambda sig, handler: installed.update({sig: handler}))
+        approve.install_stop_handlers()
+        assert installed == {approve.signal.SIGINT: approve.request_stop, approve.signal.SIGTERM: approve.request_stop}

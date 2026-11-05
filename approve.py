@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -46,6 +47,8 @@ DEFAULT_MAX_APPROVALS = 30
 PAUSE_POLL_SECONDS = 5
 STATUS_WINDOW_HOURS = 24
 EXIT_CAP_REACHED = 3
+EXIT_INTERRUPTED = 130
+INTERRUPTED = threading.Event()
 DO_NOT_MERGE = re.compile(r"do[\s_-]*not[\s_-]*merge", re.IGNORECASE)
 SLACK_RETRIES = 3
 SLACK_PAUSE = 0.4
@@ -696,6 +699,20 @@ def is_interrupt(exc):
     return contains(exc, KeyboardInterrupt)
 
 
+def stop_requested(exc):
+    return INTERRUPTED.is_set() or is_interrupt(exc)
+
+
+def request_stop(signum, frame):
+    INTERRUPTED.set()
+    raise KeyboardInterrupt
+
+
+def install_stop_handlers():
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
+
 def describe(exc):
     if isinstance(exc, BaseExceptionGroup):
         return "; ".join(describe(e) for e in exc.exceptions)
@@ -1165,6 +1182,7 @@ def main(argv=None):
     if not args.people:
         parser.error("indique au moins un username (ou --init, --doctor, --status, --pause, --resume)")
 
+    install_stop_handlers()
     cfg, auto = load_config(args.host)
     interval = args.interval or cfg["interval_seconds"]
     max_approvals = args.max_approvals or cfg["max_approvals_per_pass"]
@@ -1178,7 +1196,6 @@ def main(argv=None):
         if refusal:
             sys.exit(refusal)
     lock = acquire_lock()
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     state = load_state()
     failures, notified, exit_code = 0, False, 0
     mode = "simulation (aucune écriture)" if args.dry_run else "LIVE (approbations + réactions)"
@@ -1201,7 +1218,7 @@ def main(argv=None):
                 failed = errors > 0
                 journal("pass", errors=errors, people=args.people, dry=args.dry_run)
             except BaseException as exc:
-                if is_interrupt(exc):
+                if stop_requested(exc):
                     raise KeyboardInterrupt from None
                 if contains(exc, ApprovalCapReached):
                     save_state(state)
@@ -1233,5 +1250,13 @@ def main(argv=None):
     return exit_code
 
 
+def cli():
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print("\narrêté.", flush=True)
+        return EXIT_INTERRUPTED
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())
