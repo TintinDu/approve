@@ -84,6 +84,8 @@ Ensuite : `approve --doctor` vérifie tout.
 | `approve add dave` / `approve remove dave` / `approve list` | gère la **liste mémorisée** de personnes |
 | `approve` (sans nom) | lance la boucle sur la liste mémorisée |
 | `approve --stop` | arrête proprement l'instance qui tourne, **d'où qu'elle ait été lancée** |
+| `approve --update` | met l'outil à jour et montre les nouveautés (voir [Mettre à jour](#mettre-à-jour)) |
+| `approve --version` | affiche la version installée |
 | `approve --status` | est-ce que ça tourne ? bilan des dernières 24 h |
 | `approve --pause` / `approve --resume` | suspend / reprend sans tuer le processus |
 | `approve --init` | branche Slack et écrit la configuration |
@@ -183,6 +185,20 @@ Tout est rangé dans un seul dossier, `~/.mr-approver/` :
 ```json
 "people": { "al": { "gitlab_id": 1001, "require_announcement": true } }
 ```
+
+---
+
+## Mettre à jour
+
+```bash
+approve --update
+```
+
+La commande récupère les nouveautés de `main` et les liste. Elle **refuse de continuer** si tu as des modifications locales, si tu n'es pas sur la branche `main` ou si ta copie a divergé : elle ne touche alors à rien. Ta config, ta liste et ton historique (`~/.mr-approver/`) ne sont jamais modifiés.
+
+Une instance déjà lancée garde l'ancien code : relance-la après la mise à jour (`approve --stop`, puis `approve`). `approve --doctor` vérifie ensuite que tout est en ordre.
+
+Équivalent à la main : `git -C <dossier du dépôt> pull`.
 
 ---
 
