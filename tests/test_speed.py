@@ -102,7 +102,7 @@ class TestRecentScanReplacesPerMrSearches:
         gl, slack = FakeGitLab([make_mr(1, author=BOB)]), FakeSlack()
         stats, state = run(cfg, "bob", gl, slack)
         assert gl.posts == [] and stats["gated"] == 1
-        run(cfg, "bob", gl, slack, state, recent=[make_msg([1])])
+        run(cfg, "bob", gl, slack, state, recent=[make_msg([1], poster="bob")])
         assert gl.posts == [(1, "sha1")]
 
 
@@ -131,7 +131,8 @@ class TestDiscoverySchedule:
 
 class TestMergedMrsAreNotPolledForNothing:
     def state(self, **entry):
-        base = {"sha": "s", "author_id": ALICE, "last_seen": time.time() - 60, "last_search": time.time()}
+        base = {"sha": "s", "author_id": ALICE, "last_seen": time.time() - 60, "last_search": time.time(),
+                "author": {"username": "alice", "name": "Alice Example"}}
         return {"mrs": {"88!1": {**base, **entry}}}
 
     def test_merged_without_announcement_and_not_due_costs_nothing(self, cfg):

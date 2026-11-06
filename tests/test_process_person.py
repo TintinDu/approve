@@ -38,7 +38,7 @@ def test_gated_author_is_not_approved_when_slack_search_fails(cfg):
 
 def test_gated_author_with_announcement_is_approved_and_reacted(cfg):
     gl = FakeGitLab([make_mr(1, author=BOB)])
-    slack = FakeSlack({1: [make_msg([1])]})
+    slack = FakeSlack({1: [make_msg([1], poster="bob")]})
     run(cfg, "bob", gl, slack)
     assert gl.posts == [(1, "sha1")]
     assert slack.reacts == [("C1", "1.1", "lgtm")]
@@ -46,7 +46,7 @@ def test_gated_author_with_announcement_is_approved_and_reacted(cfg):
 
 def test_announcement_in_excluded_channel_unlocks_approval_but_gets_no_reaction(cfg):
     gl = FakeGitLab([make_mr(1, author=BOB)])
-    slack = FakeSlack({1: [make_msg([1], channel="no-reactions", channel_id="CX")]})
+    slack = FakeSlack({1: [make_msg([1], channel="no-reactions", channel_id="CX", poster="bob")]})
     run(cfg, "bob", gl, slack)
     assert gl.posts == [(1, "sha1")]
     assert slack.reacts == []

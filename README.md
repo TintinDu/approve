@@ -77,7 +77,7 @@ Ensuite : `approve --doctor` vérifie tout.
 | Commande | Effet |
 |---|---|
 | `approve alice:all` | boucle : approuve **toutes** les MR ouvertes d'`alice` |
-| `approve alice` | boucle : n'approuve que les MR d'`alice` dont le **lien a été annoncé sur Slack** (demande Slack) |
+| `approve alice` | boucle : n'approuve que les MR d'`alice` dont le **lien a été annoncé sur Slack par alice elle-même** (demande Slack) |
 | `approve alice bob:all` | plusieurs personnes à la fois |
 | `approve alice:all --dry-run --once` | simulation, une seule passe, n'écrit rien |
 | `approve --why alice bob` | **explique** pourquoi chaque MR ouverte est (ou n'est pas) approuvée ; lecture seule, utilisable pendant qu'une instance tourne |
@@ -115,7 +115,7 @@ Les noms écrits sur la ligne de commande l'emportent sur la liste.
 
 ### Le mode de chaque personne
 
-- **Sans suffixe** : seulement les MR dont le lien est annoncé sur Slack (mode prudent).
+- **Sans suffixe** : seulement les MR dont le lien est annoncé sur Slack **par leur auteur** (mode prudent).
 - **`:all`** : toutes ses MR ouvertes. À réserver aux personnes dont tu approuves tout.
 - **`:announced`** : force le mode prudent.
 
@@ -130,6 +130,12 @@ Si le nom que tu tapes désigne la même personne qu'un raccourci de ta config (
 - L'approbation est liée à la **version exacte** de la MR. Si le collègue pousse un nouveau commit et que GitLab annule ton approbation, elle est **rétablie** à la passe suivante.
 - La réaction Slack n'est posée que si **toutes** les MR citées dans le même message sont approuvées par toi. Les messages de bots sont ignorés.
 - Une MR que tu as approuvée puis qui a été mergée avant que son annonce soit trouvée reste suivie 48 h (`merged_grace_hours`), pour que la réaction Slack soit posée quand même.
+
+### Qui a le droit d'annoncer une MR
+
+Une annonce ne compte que si **l'auteur de la MR l'a postée lui-même**. Le lien d'une MR collé par un collègue (dans un fil, une discussion, une question) n'est **jamais** pris pour une annonce : il ne déclenche ni approbation, ni réaction `:lgtm:` sur le message de ce collègue.
+
+L'outil reconnaît l'auteur par son adresse ou son identifiant Slack (même nom d'utilisateur que sur GitLab), à défaut par son nom affiché. Un compte une fois reconnu est mémorisé par son identifiant Slack. En cas de doute (nom différent entre GitLab et Slack), il **n'approuve pas** : `approve --why <nom>` indique alors « le lien n'a été posté que par d'autres » et, pour les MR déjà approuvées sans annonce de l'auteur, « à vérifier ». Pour imposer l'identifiant Slack d'une personne, ajoute dans `config.json` : `"slack_ids": {"alice": "U0123ABCD"}`.
 
 ### Garde-fous
 
@@ -179,6 +185,7 @@ Tout est rangé dans un seul dossier, `~/.mr-approver/` :
 | `rediscovery_minutes` | `60` | fréquence de re-vérification des annonces déjà trouvées |
 | `merged_grace_hours` | `48` | durée pendant laquelle on suit une MR mergée pour sa réaction |
 | `reverify_minutes` | `5` | une MR dont le code n'a pas changé n'est pas revérifiée avant ce délai |
+| `slack_ids` | `{}` | facultatif : identifiant Slack à imposer par nom d'utilisateur GitLab |
 | `people` | `{}` | raccourcis facultatifs (voir ci-dessous) |
 
 **Raccourcis (`people`)** : facultatif. Pour taper `approve al` au lieu de `approve alice.martin`, ajoute :
@@ -229,7 +236,7 @@ Commence toujours par **`approve --doctor`** : il teste chaque maillon et indiqu
 | Erreur de certificat HTTPS (réseau d'entreprise) | un proxy d'inspection TLS | définis `SSL_CERT_FILE` vers le certificat racine de ton entreprise |
 | « approve tourne déjà (verrou pris) » | une autre instance tourne | `approve --status` puis `approve --stop` |
 | Aucune réaction posée | pas d'annonce trouvée, message groupé avec une MR non approuvée, ou canal exclu | `--dry-run --once` pour voir ; vérifie `exclude_channels` |
-| Une MR n'est pas approuvée | brouillon, « DO NOT MERGE », tu n'es pas approbateur autorisé, ou pas d'annonce Slack | **`approve --why <nom>`** donne la raison exacte de chaque MR |
+| Une MR n'est pas approuvée | brouillon, « DO NOT MERGE », tu n'es pas approbateur autorisé, ou pas d'annonce **de l'auteur** sur Slack | **`approve --why <nom>`** donne la raison exacte de chaque MR |
 | Ctrl-C ne semble rien faire | l'instance tourne dans un autre terminal | `approve --stop` |
 | « plafond d'approbations atteint » | plus de 30 approbations en une passe | vérifie le journal, puis relance avec `--max-approvals N` |
 | Passes en échec côté Slack | jeton révoqué, ou autorisation Hermes expirée | `approve --doctor` indique lequel |

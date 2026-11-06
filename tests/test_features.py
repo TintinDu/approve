@@ -174,7 +174,7 @@ class TestWhy:
 
     def test_announcement_gate_is_explained(self, cfg):
         mrs = [make_mr(1, author=BOB), make_mr(2, author=BOB)]
-        rows, _, _ = self.rows(cfg, mrs, who="bob", slack=FakeSlack({1: [make_msg([1])]}))
+        rows, _, _ = self.rows(cfg, mrs, who="bob", slack=FakeSlack({1: [make_msg([1], poster="bob")]}))
         assert rows["88!1"]["kind"] == "todo" and rows["88!2"]["kind"] == "unannounced"
         assert "Slack" in rows["88!2"]["reason"]
 

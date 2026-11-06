@@ -96,7 +96,7 @@ class TestSearch:
         return ok({"messages": {"matches": list(items)}})
 
     def human(self, text, ts="1.1", channel="front", cid="C1", **extra):
-        return {"channel": {"id": cid, "name": channel}, "ts": ts, "text": text, "user": "U1", **extra}
+        return {"channel": {"id": cid, "name": channel}, "ts": ts, "text": text, "user": "U0ALICE01", "username": "alice", **extra}
 
     def test_phrase_query_and_exact_url_extraction(self, server):
         text = f"review <{mr_url(7)}|MR !7> et <{mr_url(8)}|!8>"
@@ -104,7 +104,8 @@ class TestSearch:
         found = run(web(server).search_mr(7, URL_RE))
         assert server.calls[0]["http"] == "GET"
         assert server.calls[0]["query"]["query"] == ['"merge_requests/7"']
-        assert found == [{"channel": "front", "channel_id": "C1", "ts": "1.1", "urls": [mr_url(7), mr_url(8)]}]
+        assert found == [{"channel": "front", "channel_id": "C1", "ts": "1.1", "urls": [mr_url(7), mr_url(8)],
+                          "poster_id": "U0ALICE01", "poster_handle": "alice"}]
 
     def test_bot_messages_are_ignored(self, server):
         server.script["search.messages"] = [self.matches(
@@ -186,7 +187,7 @@ class TestErrors:
 def test_a_full_pass_through_the_real_http_client(server, cfg):
     gl = FakeGitLab([make_mr(1)])
     server.script["search.messages"] = [ok({"messages": {"matches": [{
-        "channel": {"id": "C1", "name": "front"}, "ts": "1.1", "user": "U1",
+        "channel": {"id": "C1", "name": "front"}, "ts": "1.1", "user": "U0ALICE01", "username": "alice",
         "text": f"<{mr_url(1)}|!1>"}]}})]
     server.script["reactions.get"] = [ok({"message": {"reactions": []}}), ok({"message": {"reactions": [
         {"name": "lgtm", "users": [ME_SLACK]}]}})]
@@ -216,7 +217,7 @@ def test_slack_id_is_deduced_from_the_token_when_the_config_has_none(server, cfg
 
 class TestRecentScan:
     def msg(self, ts, text=None):
-        return {"channel": {"id": "C1", "name": "front"}, "ts": ts, "user": "U1", "text": text or f"<{mr_url(7)}|!7>"}
+        return {"channel": {"id": "C1", "name": "front"}, "ts": ts, "user": "U0ALICE01", "username": "alice", "text": text or f"<{mr_url(7)}|!7>"}
 
     def page(self, matches, pages=1):
         return ok({"messages": {"matches": matches, "paging": {"pages": pages}}})

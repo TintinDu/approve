@@ -18,6 +18,14 @@ def mr_url(iid):
     return f"https://{HOST}/{PATH}/-/merge_requests/{iid}"
 
 
+PEOPLE = {ALICE: ("alice", "Alice Example"), BOB: ("bob", "Bob Example"), 999: ("other", "Other Person")}
+
+
+def author_of(user_id):
+    username, name = PEOPLE.get(user_id, (f"user{user_id}", f"User {user_id}"))
+    return {"id": user_id, "username": username, "name": name}
+
+
 def make_mr(iid, author=ALICE, state="opened", draft=False, sha=None):
     return {
         "project_id": PROJECT_ID,
@@ -27,16 +35,21 @@ def make_mr(iid, author=ALICE, state="opened", draft=False, sha=None):
         "sha": sha or f"sha{iid}",
         "title": f"MR {iid}",
         "web_url": mr_url(iid),
-        "author": {"id": author},
+        "author": author_of(author),
     }
 
 
-def make_msg(iids, channel="front", channel_id="C1", ts="1.1"):
+def make_msg(iids, channel="front", channel_id="C1", ts="1.1", poster="alice"):
+    full = {name[0]: name[1] for name in PEOPLE.values()}.get(poster, poster.title())
     return {
         "channel": channel,
         "channel_id": channel_id,
         "ts": ts,
         "urls": [mr_url(i) for i in iids],
+        "poster_id": f"U0{poster.upper()}01",
+        "poster_name": full,
+        "poster_email": f"{poster}@example.com",
+        "poster_handle": poster,
     }
 
 
