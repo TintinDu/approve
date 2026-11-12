@@ -46,6 +46,7 @@ TOKEN_PATH = APP_DIR / "slack_token"
 TOKEN_ENV = "MR_APPROVER_SLACK_TOKEN"
 FAILURES_BEFORE_NOTIFY = 3
 DEFAULT_MAX_APPROVALS = 30
+DEFAULT_REVERIFY_MINUTES = 5
 PAUSE_POLL_SECONDS = 5
 STATUS_WINDOW_HOURS = 24
 EXIT_CAP_REACHED = 3
@@ -83,7 +84,7 @@ DEFAULT_CONFIG = {
     "interval_seconds": 300,
     "rediscovery_minutes": 60,
     "merged_grace_hours": 48,
-    "reverify_minutes": 30,
+    "reverify_minutes": DEFAULT_REVERIFY_MINUTES,
     "max_approvals_per_pass": DEFAULT_MAX_APPROVALS,
     "slack_backend": "auto",
     "slack_mcp": {
@@ -571,7 +572,7 @@ async def run_all(coros):
         raise unwrap_group(caught) from None
 
 
-STAT_KEYS = ["open", "approved", "already", "would_approve", "skipped", "gated", "reacted",
+STAT_KEYS = ["open", "approved", "reapproved", "already", "would_approve", "skipped", "gated", "reacted",
              "would_react", "errors", "not_allowed", "do_not_merge"]
 
 
@@ -582,7 +583,7 @@ async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, 
     now = time.time()
     scan_ok = recent is not None
     recent = recent or []
-    reverify = cfg.get("reverify_minutes", 30) * 60
+    reverify = cfg.get("reverify_minutes", DEFAULT_REVERIFY_MINUTES) * 60
     mrs = [m for m in await asyncio.to_thread(gl.open_mrs, person["gitlab_id"]) if not m.get("draft")]
     stats["open"] = len(mrs)
     cache = {}
@@ -609,6 +610,7 @@ async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, 
                 stats["gated"] += 1
                 return
             try:
+                previously_approved = bool(entry.get("approved_sha"))
                 blocked = entry.get("blocked", {})
                 unchanged = entry.get("approved_sha") == mr.get("sha") and now - entry.get("verified_at", 0) < reverify
                 still_blocked = blocked.get("sha") == mr.get("sha") and now - blocked.get("at", 0) < reverify
@@ -627,8 +629,12 @@ async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, 
                     entry.update(approved_sha=sha, verified_at=now if not unchanged else entry["verified_at"])
                     cache[mr["web_url"]] = True
                 if outcome in ("approved", "would_approve"):
-                    journal("approval", mr=key, sha=sha, url=mr["web_url"], dry=dry)
-                    log(f"  {'DRY approuverait' if dry else 'approuvée'} {key} {mr['title'][:60]}")
+                    again = previously_approved
+                    stats["reapproved"] += int(again and outcome == "approved")
+                    journal("approval", mr=key, sha=sha, url=mr["web_url"], dry=dry, reapproved=again)
+                    verb = ("DRY ré-approuverait" if again else "DRY approuverait") if dry else (
+                        "ré-approuvée" if again else "approuvée")
+                    log(f"  {verb} {key} {mr['title'][:60]}")
                 if outcome in ("approved", "already", "would_approve"):
                     await reconcile_reactions(
                         slack, gl, entry, cfg, me, mr_url_re, dry or outcome == "would_approve",
@@ -816,6 +822,7 @@ async def run_pass(cfg, names, dry, state, max_approvals):
                 f"{name}: {s['open']} ouvertes, {s['approved'] + s['would_approve']} "
                 f"approuvées, {s['already']} déjà, {s['gated']} sans annonce, "
                 f"{s['reacted'] + s['would_react']} réactions"
+                + (f" dont {s['reapproved']} ré-approuvées" if s["reapproved"] else "")
                 + (f", {s['do_not_merge']} DO NOT MERGE" if s["do_not_merge"] else "")
                 + (f", {s['not_allowed']} non approuvables" if s["not_allowed"] else "")
                 + (f", {s['errors']} erreurs" if s["errors"] else "")

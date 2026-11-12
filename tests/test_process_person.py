@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 import approve
@@ -174,3 +175,24 @@ class TestMergedBeforeAnnouncement:
         slack = FakeSlack({1: [make_msg([1])]})
         run(cfg, "alice", gl, slack, state=state)
         assert slack.searches == [] and slack.reactor_reads == [] and slack.reacts == []
+
+
+def test_first_approval_is_not_reported_as_a_reapproval(cfg):
+    stats, _ = run(cfg, "alice", FakeGitLab([make_mr(1)]), FakeSlack())
+    assert stats["approved"] == 1 and stats["reapproved"] == 0
+
+
+def test_approval_restored_after_a_push_is_reported_as_a_reapproval(cfg, capsys):
+    gl, slack = FakeGitLab([make_mr(1, sha="old")]), FakeSlack()
+    _, state = run(cfg, "alice", gl, slack)
+    gl.mrs[1]["sha"] = "new"
+    gl.approvals.clear()
+    stats, _ = run(cfg, "alice", gl, slack, state)
+    assert stats["approved"] == 1 and stats["reapproved"] == 1
+    assert "ré-approuvée" in capsys.readouterr().out
+    rows = [json.loads(line) for line in approve.JOURNAL_PATH.read_text().splitlines()]
+    assert [r["reapproved"] for r in rows if r["event"] == "approval"] == [False, True]
+
+
+def test_default_reverify_delay_is_five_minutes():
+    assert approve.DEFAULT_CONFIG["reverify_minutes"] == 5

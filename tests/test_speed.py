@@ -37,7 +37,7 @@ class TestUnchangedMergeRequestsCostNothing:
     def test_it_is_checked_again_after_the_reverify_delay(self, cfg):
         gl, slack = FakeGitLab([make_mr(1)]), FakeSlack()
         _, state = run(cfg, "alice", gl, slack)
-        state["mrs"]["88!1"]["verified_at"] -= 31 * 60
+        state["mrs"]["88!1"]["verified_at"] -= 6 * 60
         gl.calls.clear()
         run(cfg, "alice", gl, slack, state)
         assert "approval_info:1" in gl.calls
@@ -46,7 +46,7 @@ class TestUnchangedMergeRequestsCostNothing:
         gl, slack = FakeGitLab([make_mr(1)]), FakeSlack()
         _, state = run(cfg, "alice", gl, slack)
         gl.approvals.clear()
-        state["mrs"]["88!1"]["verified_at"] -= 31 * 60
+        state["mrs"]["88!1"]["verified_at"] -= 6 * 60
         run(cfg, "alice", gl, slack, state)
         assert len(gl.posts) == 2
 
