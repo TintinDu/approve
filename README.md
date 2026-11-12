@@ -253,6 +253,6 @@ python3 -m venv .venv && .venv/bin/pip install pytest
 .venv/bin/python -m pytest
 ```
 
-L'outil n'a **aucune dépendance** hors la bibliothèque standard de Python. Les tests utilisent de faux clients GitLab et un faux serveur Slack local : aucun appel réseau externe, aucune écriture. La CI GitHub Actions les lance sur Python 3.11 et 3.14 à chaque pull request.
+L'outil n'a **aucune dépendance** hors la bibliothèque standard de Python. Les tests utilisent de faux clients GitLab et un faux serveur Slack local : aucun appel réseau externe, aucune écriture. Il n'y a pas de CI hébergée : lance les tests en local avant chaque pull request.
 
 Les modifications de `main` passent par une pull request.
