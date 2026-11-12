@@ -1619,10 +1619,10 @@ def git(root, *args):
 def version_text():
     root = repo_root()
     if not (root / ".git").exists() or not shutil.which("git"):
-        return "mr-approver (version inconnue : pas un clone Git)"
+        return "approve (version inconnue : pas un clone Git)"
     sha = git(root, "rev-parse", "--short", "HEAD").stdout.strip()
     day = git(root, "log", "-1", "--format=%cs").stdout.strip()
-    return f"mr-approver {sha} ({day})"
+    return f"approve {sha} ({day})"
 
 
 def cmd_update():

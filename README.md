@@ -1,4 +1,4 @@
-# mr-approver
+# approve
 
 Un petit outil qui tourne dans un terminal et, toutes les 5 minutes :
 
