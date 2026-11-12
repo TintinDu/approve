@@ -33,6 +33,12 @@ Remplace `alice` par le **username GitLab** d'un collègue. `:all` veut dire « 
 
 Ça tourne jusqu'à **Ctrl-C**.
 
+### Installer avec un assistant IA
+
+Le dépôt contient un skill, [`setup-approve`](.agents/skills/setup-approve/SKILL.md), qui guide n'importe quel assistant IA (Codex, Claude Code, Cursor…) dans l'installation et les réglages. Clone le dépôt, ouvre-le avec ton assistant, puis demande-lui par exemple : « installe et configure approve ». Dans Claude Code, tape `/setup-approve`.
+
+L'assistant lance les vérifications ; tout ce qui touche à un secret (connexion à GitLab, jeton Slack) reste à ta charge, dans ton terminal. Il ne démarre jamais la boucle à ta place.
+
 ### Ce que Slack ajoute
 
 Sans Slack, il n'y a ni réaction, ni possibilité de n'approuver que les MR **annoncées** dans Slack. Branche Slack si tu veux ça (voir [Brancher Slack](#brancher-slack)) ; tout le reste marche déjà.
