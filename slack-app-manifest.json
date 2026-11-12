@@ -1,6 +1,6 @@
 {
   "display_information": {
-    "name": "mr-approver",
+    "name": "approve",
     "description": "Lit les annonces de merge requests et y ajoute une réaction."
   },
   "oauth_config": {

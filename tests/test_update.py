@@ -94,7 +94,7 @@ class TestUpdate:
 class TestVersion:
     def test_shows_the_commit_and_its_date(self, repos):
         text = approve.version_text()
-        assert text.startswith("mr-approver ") and "(" in text
+        assert text.startswith("approve ") and "(" in text
 
     def test_outside_a_clone_it_says_so(self, tmp_path, monkeypatch):
         monkeypatch.setattr(approve, "repo_root", lambda: tmp_path)
@@ -102,7 +102,7 @@ class TestVersion:
 
     def test_routed_from_the_command_line(self, repos, capsys):
         assert approve.main(["--version"]) == 0
-        assert "mr-approver" in capsys.readouterr().out
+        assert capsys.readouterr().out.startswith("approve ")
 
     def test_update_is_routed_from_the_command_line(self, repos, capsys):
         assert approve.main(["--update"]) == 0
