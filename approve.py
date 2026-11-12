@@ -98,8 +98,76 @@ Check = namedtuple("Check", "ok label detail hint")
 sys.path.insert(0, str(HERMES / "hermes-agent"))
 
 
-def log(msg):
-    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+ANSI = {"bold": "1", "dim": "2", "red": "91", "green": "92", "yellow": "93",
+        "blue": "94", "magenta": "95", "cyan": "96"}
+LOG_MARKS = {"ok": ("■", "green"), "again": ("▣", "cyan"), "err": ("▚", "red"),
+             "warn": ("▒", "yellow"), "pass": ("▓▒░", "magenta")}
+BANNER_TEXT = "APPROVE"
+BANNER_TAGLINE = "▀▄▀▄▀▄  NO LLM · NO MERCY · LGTM  ▄▀▄▀▄▀"
+BANNER_ROW_COLORS = ["magenta", "magenta", "blue", "cyan", "cyan"]
+BANNER_PIXEL = "██"
+BANNER_FONT = {
+    "A": [".##.", "#..#", "####", "#..#", "#..#"],
+    "P": ["###.", "#..#", "###.", "#...", "#..."],
+    "R": ["###.", "#..#", "###.", "#.#.", "#..#"],
+    "O": [".##.", "#..#", "#..#", "#..#", ".##."],
+    "V": ["#..#", "#..#", "#..#", "#..#", ".##."],
+    "E": ["####", "#...", "###.", "#...", "####"],
+}
+
+
+def color_enabled(stream=None):
+    stream = stream or sys.stdout
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    return stream.isatty()
+
+
+def paint(text, *styles):
+    if not styles or not color_enabled():
+        return text
+    return f"\x1b[{';'.join(ANSI[style] for style in styles)}m{text}\x1b[0m"
+
+
+def log(msg, kind=None):
+    stamp = paint(f"[{datetime.now():%H:%M:%S}]", "dim")
+    if kind in LOG_MARKS and color_enabled():
+        mark, color = LOG_MARKS[kind]
+        print(f"{stamp} {paint(mark, color, 'bold')} {paint(msg.lstrip(), color)}", flush=True)
+    else:
+        print(f"{stamp} {msg}", flush=True)
+
+
+def banner_rows():
+    glyphs = [BANNER_FONT[letter] for letter in BANNER_TEXT]
+    rows = []
+    for y in range(len(glyphs[0])):
+        cells = ("".join(BANNER_PIXEL if bit == "#" else " " * len(BANNER_PIXEL) for bit in glyph[y])
+                 for glyph in glyphs)
+        rows.append("  ".join(cells).rstrip())
+    return rows
+
+
+def print_banner():
+    if not color_enabled():
+        return
+    print()
+    for row, color in zip(banner_rows(), BANNER_ROW_COLORS):
+        print(paint(row, color, "bold"))
+    print(paint(BANNER_TAGLINE, "yellow") + "\n", flush=True)
+
+
+def heading(text, plain=None):
+    if color_enabled():
+        print(paint(f"▓▒░ {text.upper()} ░▒▓", "magenta", "bold"), flush=True)
+    elif plain is not None:
+        print(plain, flush=True)
+
+
+def check_mark(ok):
+    if not color_enabled():
+        return "✓" if ok else "✗"
+    return paint("■", "green", "bold") if ok else paint("▚", "red", "bold")
 
 
 def journal(event, **data):
@@ -531,14 +599,14 @@ async def reconcile_reactions(slack, gl, entry, cfg, me, mr_url_re, dry, now, ca
             if not present:
                 if dry:
                     stats["would_react"] += 1
-                    log(f"  DRY réaction :{emoji}: sur {msg['channel']} {msg['ts']}")
+                    log(f"  DRY réaction :{emoji}: sur {msg['channel']} {msg['ts']}", "warn")
                     continue
                 await slack.react(msg["channel_id"], msg["ts"], emoji)
                 if me["slack_id"] not in await slack.reactors(msg["channel_id"], msg["ts"], emoji):
                     raise RuntimeError(f"reaction not visible on {key}")
                 stats["reacted"] += 1
                 journal("reaction_added", channel=msg["channel"], ts=msg["ts"], urls=msg["urls"])
-                log(f"  réaction :{emoji}: ajoutée sur {msg['channel']} {msg['ts']}")
+                log(f"  réaction :{emoji}: ajoutée sur {msg['channel']} {msg['ts']}", "ok")
             reactions[key] = cache[("msg", key)] = {"at": now}
 
 
@@ -603,7 +671,7 @@ async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, 
                     await discover(slack, mr, entry, mr_url_re, now, search_due(key, now, cfg))
             except RuntimeError as exc:
                 stats["errors"] += 1
-                log(f"  recherche Slack en échec pour {key}: {exc}")
+                log(f"  recherche Slack en échec pour {key}: {exc}", "warn")
                 if person["require_announcement"]:
                     return
             if person["require_announcement"] and not entry.get("messages"):
@@ -634,7 +702,8 @@ async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, 
                     journal("approval", mr=key, sha=sha, url=mr["web_url"], dry=dry, reapproved=again)
                     verb = ("DRY ré-approuverait" if again else "DRY approuverait") if dry else (
                         "ré-approuvée" if again else "approuvée")
-                    log(f"  {verb} {key} {mr['title'][:60]}")
+                    log(f"  {verb} {key} {mr['title'][:60]}",
+                        "warn" if dry else "again" if again else "ok")
                 if outcome in ("approved", "already", "would_approve"):
                     await reconcile_reactions(
                         slack, gl, entry, cfg, me, mr_url_re, dry or outcome == "would_approve",
@@ -643,7 +712,7 @@ async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, 
             except RuntimeError as exc:
                 stats["errors"] += 1
                 journal("error", mr=key, error=str(exc))
-                log(f"  erreur sur {key}: {exc}")
+                log(f"  erreur sur {key}: {exc}", "err")
 
     await run_all(handle(mr) for mr in mrs)
     await process_merged(person, cfg, gl, slack, state, dry, mr_url_re, cache, stats, now,
@@ -692,7 +761,7 @@ async def process_merged(person, cfg, gl, slack, state, dry, mr_url_re, cache, s
             except RuntimeError as exc:
                 stats["errors"] += 1
                 journal("error", mr=key, error=str(exc))
-                log(f"  erreur sur MR mergée {key}: {exc}")
+                log(f"  erreur sur MR mergée {key}: {exc}", "err")
 
     await run_all(handle(key, entry) for key, entry in candidates)
 
@@ -806,7 +875,7 @@ async def run_pass(cfg, names, dry, state, max_approvals):
             try:
                 recent = await slack.search_recent(since - SCAN_MARGIN_SECONDS, mr_url_re)
             except Exception as exc:
-                log(f"  balayage Slack récent en échec ({describe(exc)}) : recherche MR par MR")
+                log(f"  balayage Slack récent en échec ({describe(exc)}) : recherche MR par MR", "warn")
         results = {}
 
         async def one(name):
@@ -829,7 +898,7 @@ async def run_pass(cfg, names, dry, state, max_approvals):
             )
         if recent is not None or not since:
             state["recent_scan"] = started
-        log(" | ".join(parts) + (" [simulation]" if dry else ""))
+        log(" | ".join(parts) + (" [simulation]" if dry else ""), "pass")
     return errors
 
 
@@ -1328,13 +1397,14 @@ async def check_slack_token(cfg):
 
 
 def print_check(check):
-    print(f"  {'✓' if check.ok else '✗'} {check.label}" + (f" — {check.detail}" if check.detail else ""))
+    print(f"  {check_mark(check.ok)} {check.label}" + (f" — {check.detail}" if check.detail else ""))
     if not check.ok:
         print(f"      → {check.hint}")
 
 
 def cmd_doctor(host=None):
-    print("Vérification de l'installation\n")
+    heading("Vérification de l'installation", "Vérification de l'installation")
+    print()
     results = [check_python()]
     notes = []
     config_check, cfg = check_config(host)
@@ -1635,6 +1705,7 @@ def main(argv=None):
         print("en pause" if args.pause else "reprise")
         return 0
     if args.status:
+        heading("Statut")
         print(status_report())
         return 0
     if args.stop:
@@ -1664,6 +1735,7 @@ def main(argv=None):
     state = load_state()
     failures, notified, exit_code = 0, False, 0
     mode = "simulation (aucune écriture)" if args.dry_run else "LIVE (approbations + réactions)"
+    print_banner()
     if auto:
         log(f"Aucune config : serveur {cfg['gitlab_host']} et compte détectés depuis glab")
     if backend is None:
@@ -1675,7 +1747,7 @@ def main(argv=None):
     try:
         while True:
             if PAUSE_PATH.exists():
-                log("en pause (approve --resume pour reprendre)")
+                log("en pause (approve --resume pour reprendre)", "warn")
                 while PAUSE_PATH.exists():
                     time.sleep(PAUSE_POLL_SECONDS)
                 log("reprise")
@@ -1691,14 +1763,14 @@ def main(argv=None):
                     save_state(state)
                     journal("cap_reached", cap=max_approvals, dry=args.dry_run)
                     log(f"plafond de {max_approvals} approbations atteint dans une passe : arrêt. "
-                        "Vérifie le journal, puis relance avec --max-approvals N si c'est voulu.")
+                        "Vérifie le journal, puis relance avec --max-approvals N si c'est voulu.", "warn")
                     notify("approve", f"plafond de {max_approvals} approbations atteint, arrêté")
                     exit_code = EXIT_CAP_REACHED
                     break
                 if not isinstance(exc, Exception):
                     raise
                 failed = True
-                log(f"passe en échec: {describe(exc)}")
+                log(f"passe en échec: {describe(exc)}", "err")
                 journal("pass_failed", error=describe(exc))
             failures = failures + 1 if failed else 0
             if failures >= FAILURES_BEFORE_NOTIFY and not notified:

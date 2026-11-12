@@ -162,6 +162,7 @@ Tout est rangé dans un seul dossier, `~/.mr-approver/` :
 | `MR_APPROVER_SLACK_TOKEN` | jeton Slack, sans l'écrire sur le disque |
 | `HERMES_HOME` | emplacement de Hermes, s'il n'est pas dans `~/.hermes` |
 | `MR_APPROVER_PYTHON` | Python à utiliser (3.11 ou plus) |
+| `NO_COLOR` | désactive la bannière pixel art et les couleurs (aussi coupées hors terminal, ou avec `TERM=dumb`) |
 
 ### Les réglages de `config.json`
 
