@@ -22,7 +22,8 @@ HUMAN = "Alice EXAMPLE <alice@example.com> (ID: U0ALICE001) "
 def test_extracts_channel_ts_and_exact_url():
     text = search(block(1, 1, "front", "C1", HUMAN, "1.5", f"review <{mr_url(7)}|MR !7>"))
     assert parse_search(text, URL_RE) == [
-        {"channel": "front", "channel_id": "C1", "ts": "1.5", "urls": [mr_url(7)]}
+        {"channel": "front", "channel_id": "C1", "ts": "1.5", "urls": [mr_url(7)], "poster_id": "U0ALICE001",
+         "poster_name": "Alice EXAMPLE", "poster_email": "alice@example.com"}
     ]
 
 

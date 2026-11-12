@@ -13,10 +13,11 @@ import subprocess
 import sys
 import threading
 import time
-import zlib
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections import namedtuple
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -51,6 +52,8 @@ PAUSE_POLL_SECONDS = 5
 STATUS_WINDOW_HOURS = 24
 EXIT_CAP_REACHED = 3
 EXIT_INTERRUPTED = 130
+STATE_VERSION = 2
+FORGOTTEN_ON_MIGRATION = ("messages", "last_search", "search_due", "reactions", "recheck_at", "foreign")
 STOP_WAIT_SECONDS = 40
 SUBCOMMANDS = ("add", "remove", "list")
 INTERRUPTED = threading.Event()
@@ -443,9 +446,42 @@ def parse_web_matches(matches, mr_url_re):
                 "channel_id": channel["id"],
                 "ts": match["ts"],
                 "urls": sorted(set(mr_url_re.findall(text))),
+                "poster_id": match.get("user"),
+                "poster_handle": match.get("username"),
             }
         )
     return messages
+
+
+POSTER_RE = re.compile(r"From: (?P<name>.*?)\s*(?:<(?P<email>[^>]*)>)?\s*\(ID: (?P<id>[A-Z0-9]+)\)")
+
+
+def normalize_name(text):
+    plain = unicodedata.normalize("NFKD", text or "")
+    letters = "".join(ch if ch.isalpha() or ch.isspace() else " " for ch in plain if not unicodedata.combining(ch))
+    return tuple(sorted(letters.lower().split()))
+
+
+def poster_is_author(msg, author, learned):
+    poster = msg.get("poster_id")
+    username = (author or {}).get("username", "")
+    if not poster or not username:
+        return False
+    if username in learned:
+        return learned[username] == poster
+    email = (msg.get("poster_email") or "").split("@")[0].lower()
+    handle = (msg.get("poster_handle") or "").lower()
+    same_account = username.lower() in (email, handle)
+    author_name = normalize_name(author.get("name", ""))
+    same_name = bool(author_name) and normalize_name(msg.get("poster_name")) == author_name
+    if same_account or same_name:
+        learned[username] = poster
+        return True
+    return False
+
+
+def poster_label(msg):
+    return msg.get("poster_name") or msg.get("poster_handle") or msg.get("poster_id") or "?"
 
 
 def parse_search(text, mr_url_re):
@@ -456,22 +492,36 @@ def parse_search(text, mr_url_re):
         sender = re.search(r"From: (.*)", block)
         if not channel or not ts or (sender and "[BOT]" in sender.group(1)):
             continue
+        poster = POSTER_RE.search(block)
         messages.append(
             {
                 "channel": channel.group(1).lstrip("#"),
                 "channel_id": channel.group(2),
                 "ts": ts.group(1),
                 "urls": sorted(set(mr_url_re.findall(block))),
+                "poster_id": poster.group("id") if poster else None,
+                "poster_name": poster.group("name").strip() if poster else None,
+                "poster_email": poster.group("email") if poster else None,
             }
         )
     return messages
 
 
+def migrate_state(state):
+    for entry in state.get("mrs", {}).values():
+        for key in FORGOTTEN_ON_MIGRATION:
+            entry.pop(key, None)
+    state.pop("recent_scan", None)
+    state["version"] = STATE_VERSION
+    return state
+
+
 def load_state():
     try:
-        return json.loads(STATE_PATH.read_text())
+        state = json.loads(STATE_PATH.read_text())
     except (OSError, ValueError):
-        return {"mrs": {}}
+        return {"mrs": {}, "version": STATE_VERSION}
+    return state if state.get("version") == STATE_VERSION else migrate_state(state)
 
 
 def save_state(state):
@@ -486,28 +536,34 @@ def search_due(key, now, cfg):
     return now + cfg.get("rediscovery_minutes", 60) * 60 * spread
 
 
-async def discover(slack, mr, entry, mr_url_re, now, due=None):
-    found = await slack.search_mr(mr["iid"], mr_url_re)
+def keep_author_messages(candidates, mr, entry, ids):
     known = {(m["channel_id"], m["ts"]): m for m in entry.get("messages", [])}
-    for m in found:
-        if mr["web_url"] in m["urls"]:
+    foreign = set(entry.get("foreign", []))
+    changed = False
+    for m in candidates:
+        if mr["web_url"] not in m["urls"]:
+            continue
+        if poster_is_author(m, mr.get("author", {}), ids):
+            if (m["channel_id"], m["ts"]) not in known:
+                changed = True
             known[(m["channel_id"], m["ts"])] = m
+        else:
+            foreign.add(poster_label(m))
     entry["messages"] = list(known.values())
+    entry["foreign"] = sorted(foreign)[:3]
+    return changed
+
+
+async def discover(slack, mr, entry, mr_url_re, now, due=None, ids=None):
+    found = await slack.search_mr(mr["iid"], mr_url_re)
+    keep_author_messages(found, mr, entry, {} if ids is None else ids)
     entry["last_search"] = now
     if due is not None:
         entry["search_due"] = due
 
 
-def apply_recent(entry, mr_url, recent):
-    known = {(m["channel_id"], m["ts"]): m for m in entry.get("messages", [])}
-    changed = False
-    for m in recent:
-        if mr_url in m["urls"] and (m["channel_id"], m["ts"]) not in known:
-            known[(m["channel_id"], m["ts"])] = m
-            changed = True
-    if changed:
-        entry["messages"] = list(known.values())
-    return changed
+def apply_recent(entry, mr, recent, ids=None):
+    return keep_author_messages(recent, mr, entry, {} if ids is None else ids)
 
 
 def needs_discovery(entry, person, cfg, now, scan_ok=False):
@@ -610,6 +666,10 @@ async def reconcile_reactions(slack, gl, entry, cfg, me, mr_url_re, dry, now, ca
             reactions[key] = cache[("msg", key)] = {"at": now}
 
 
+def compact_author(author):
+    return {"username": author.get("username", ""), "name": author.get("name", "")}
+
+
 def make_mr_url_re(host):
     return re.compile(r"(https://" + re.escape(host) + r"/[\w.\-/]+?/-/merge_requests/\d+)")
 
@@ -652,6 +712,7 @@ async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, 
     scan_ok = recent is not None
     recent = recent or []
     reverify = cfg.get("reverify_minutes", DEFAULT_REVERIFY_MINUTES) * 60
+    ids = state.setdefault("slack_ids", {})
     mrs = [m for m in await asyncio.to_thread(gl.open_mrs, person["gitlab_id"]) if not m.get("draft")]
     stats["open"] = len(mrs)
     cache = {}
@@ -664,11 +725,12 @@ async def process_person(name, person, cfg, gl, slack, state, dry, budget=None, 
                 stats["do_not_merge"] += 1
                 return
             entry = state["mrs"].setdefault(key, {})
-            entry.update(author_id=person["gitlab_id"], last_seen=now, web_url=mr["web_url"])
-            apply_recent(entry, mr["web_url"], recent)
+            entry.update(author_id=person["gitlab_id"], last_seen=now, web_url=mr["web_url"],
+                         author=compact_author(mr.get("author", {})))
+            apply_recent(entry, mr, recent, ids)
             try:
                 if needs_discovery(entry, person, cfg, now, scan_ok):
-                    await discover(slack, mr, entry, mr_url_re, now, search_due(key, now, cfg))
+                    await discover(slack, mr, entry, mr_url_re, now, search_due(key, now, cfg), ids)
             except RuntimeError as exc:
                 stats["errors"] += 1
                 log(f"  recherche Slack en échec pour {key}: {exc}", "warn")
@@ -732,7 +794,8 @@ async def process_merged(person, cfg, gl, slack, state, dry, mr_url_re, cache, s
         if now - entry["last_seen"] > grace or entry.get("author_id", person["gitlab_id"]) != person["gitlab_id"]:
             continue
         if entry.get("web_url") and recent:
-            apply_recent(entry, entry["web_url"], recent)
+            apply_recent(entry, {"web_url": entry["web_url"], "author": entry.get("author", {})}, recent,
+                         state.setdefault("slack_ids", {}))
         if settled(entry, cfg, now) or entry.get("recheck_at", 0) > now:
             continue
         if not entry.get("messages") and not needs_discovery(entry, person, cfg, now, scan_ok):
@@ -754,7 +817,8 @@ async def process_merged(person, cfg, gl, slack, state, dry, mr_url_re, cache, s
                 if fresh["state"] != "merged" or me["gitlab_id"] not in approvers:
                     return
                 if needs_discovery(entry, person, cfg, now, scan_ok):
-                    await discover(slack, fresh, entry, mr_url_re, now, search_due(key, now, cfg))
+                    await discover(slack, fresh, entry, mr_url_re, now, search_due(key, now, cfg),
+                                   state.setdefault("slack_ids", {}))
                 await reconcile_reactions(slack, gl, entry, cfg, me, mr_url_re, dry, now, cache, stats)
                 if not settled(entry, cfg, now):
                     entry["recheck_at"] = now + RECHECK_SECONDS
@@ -868,6 +932,7 @@ async def run_pass(cfg, names, dry, state, max_approvals):
     async with slack_session(cfg) as slack:
         if not cfg["me"].get("slack_id"):
             cfg["me"]["slack_id"] = await slack.whoami()
+        state.setdefault("slack_ids", {}).update(cfg.get("slack_ids", {}))
         started = time.time()
         since = state.get("recent_scan")
         recent = None
@@ -1518,8 +1583,9 @@ def cmd_watch(sub, tokens, host=None):
     return 0
 
 
-WHY_ORDER = ("todo", "unannounced", "notallowed", "dnm", "draft", "done")
+WHY_ORDER = ("orphan", "todo", "unannounced", "notallowed", "dnm", "draft", "done")
 WHY_LABELS = {
+    "orphan": ("!", "à vérifier"),
     "todo": ("→", "à approuver"),
     "unannounced": ("○", "non annoncée"),
     "notallowed": ("✗", "non approuvable"),
@@ -1554,14 +1620,21 @@ async def explain_person(person, cfg, gl, slack, state, recent):
                 if isinstance(slack, NoSlack):
                     return row("unannounced", "Slack n'est pas branché : écris nom:all pour tout approuver")
                 entry = state["mrs"].setdefault(key, {})
-                apply_recent(entry, mr["web_url"], recent)
+                ids = state.setdefault("slack_ids", {})
+                apply_recent(entry, mr, recent, ids)
                 try:
                     if needs_discovery(entry, person, cfg, now, scan_ok):
-                        await discover(slack, mr, entry, mr_url_re, now, search_due(key, now, cfg))
+                        await discover(slack, mr, entry, mr_url_re, now, search_due(key, now, cfg), ids)
                 except RuntimeError as exc:
                     return row("unannounced", f"recherche Slack impossible ({exc})")
                 if not entry.get("messages"):
-                    return row("unannounced", "aucun lien trouvé dans Slack (mode « annoncées »)")
+                    others = entry.get("foreign", [])
+                    reason = ("le lien n'a été posté que par d'autres (" + ", ".join(others) + ") : l'auteur doit l'annoncer"
+                              if others else "aucun lien trouvé dans Slack (mode « annoncées »)")
+                    approvers, _ = await asyncio.to_thread(gl.approval_info, mr["project_id"], mr["iid"])
+                    if me["gitlab_id"] in approvers:
+                        return row("orphan", "déjà approuvée par toi, mais sans annonce de l'auteur : à vérifier")
+                    return row("unannounced", reason)
             approvers, can_approve = await asyncio.to_thread(gl.approval_info, mr["project_id"], mr["iid"])
             if me["gitlab_id"] in approvers:
                 return row("done")
@@ -1591,6 +1664,7 @@ async def why_pass(cfg, names):
     state = copy.deepcopy(load_state())
     mr_url_re = make_mr_url_re(cfg["gitlab_host"])
     async with slack_session(cfg) as slack:
+        state.setdefault("slack_ids", {}).update(cfg.get("slack_ids", {}))
         recent = None
         if state.get("recent_scan"):
             try:
