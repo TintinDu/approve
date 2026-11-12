@@ -177,7 +177,7 @@ Tout est rangé dans un seul dossier, `~/.mr-approver/` :
 | `max_approvals_per_pass` | `30` | plafond d'approbations par passe |
 | `rediscovery_minutes` | `60` | fréquence de re-vérification des annonces déjà trouvées |
 | `merged_grace_hours` | `48` | durée pendant laquelle on suit une MR mergée pour sa réaction |
-| `reverify_minutes` | `30` | une MR dont le code n'a pas changé n'est pas revérifiée avant ce délai |
+| `reverify_minutes` | `5` | une MR dont le code n'a pas changé n'est pas revérifiée avant ce délai |
 | `people` | `{}` | raccourcis facultatifs (voir ci-dessous) |
 
 **Raccourcis (`people`)** : facultatif. Pour taper `approve al` au lieu de `approve alice.martin`, ajoute :
